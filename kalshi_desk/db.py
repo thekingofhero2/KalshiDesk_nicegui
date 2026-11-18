@@ -702,6 +702,22 @@ def positions(env: str) -> list:
     return rows
 
 
+def latest_client_order_ids(env: str) -> dict:
+    """每个 ticker 最近的买入单 client_order_id，用于在持仓行标注来源订单。"""
+    try:
+        rows = _query(
+            "SELECT ticker, client_order_id FROM ("
+            "  SELECT ticker, client_order_id,"
+            "         ROW_NUMBER() OVER (PARTITION BY ticker"
+            "           ORDER BY CASE WHEN action='buy' THEN 0 ELSE 1 END,"
+            "                    updated_ts DESC) rn"
+            "  FROM orders WHERE env=? AND client_order_id IS NOT NULL"
+            ") WHERE rn=1", [env])
+    except Exception:
+        return {}
+    return {r["ticker"]: r["client_order_id"] for r in rows if r.get("ticker")}
+
+
 def reconcile_resting(env: str, keep_ids: list, ticker: Optional[str] = None) -> int:
     """用在挂订单的权威快照校正本地库。
 

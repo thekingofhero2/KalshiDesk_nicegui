@@ -1379,6 +1379,8 @@ class DeskUI:
             self._api_btn("动量交易", icon="trending_up",
                           coro=lambda: self.open_trade(momentum=True)) \
                 .props("unelevated dense color=positive")
+            self._api_btn("刷新持仓", icon="refresh", coro=self.refresh_positions) \
+                .props("dense flat")
             ui.label("选中任意持仓行 → 查看实时行情并直接平仓 / 买入 / 卖出；"
                      "动量交易自动跟随上涨腿").classes("text-xs kd-mut")
         self.pos_table = ui.table(
@@ -1390,6 +1392,7 @@ class DeskUI:
                 {"name": "pnl", "label": "已实现盈亏", "field": "pnl", "align": "right"},
                 {"name": "resting", "label": "在挂", "field": "resting", "align": "right"},
                 {"name": "shard", "label": "shard", "field": "shard", "align": "center"},
+                {"name": "cid", "label": "cid", "field": "cid", "align": "left"},
                 {"name": "act", "label": "操作", "field": "act", "align": "center"},
             ],
             rows=[], row_key="id", pagination=12, selection="single",
@@ -2638,6 +2641,10 @@ class DeskUI:
     def render_positions(self) -> None:
         positions = self.state.get("positions") or []
         self.pos_by_ticker = {p["ticker"]: p for p in positions}
+        try:
+            cid_map = db.latest_client_order_ids(self.api.env) if self.api else {}
+        except Exception:
+            cid_map = {}
         if table := self._el("pos_table"):
             table.rows = [{
                 "id": p["ticker"],
@@ -2648,6 +2655,7 @@ class DeskUI:
                 "pnl": usd(p.get("realized_pnl"), signed=True),
                 "resting": str(p.get("resting") or 0),
                 "shard": "—" if p.get("exchange_index") is None else str(p.get("exchange_index")),
+                "cid": (cid_map.get(p["ticker"]) or "—")[:18],
             } for p in positions]
             table.update()
         if c_expo := self._el("c_expo"):
