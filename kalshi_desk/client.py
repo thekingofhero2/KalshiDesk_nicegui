@@ -39,21 +39,28 @@ class KalshiClient:
     """Kalshi Trade API V2 客户端（官方 OpenAPI 规范）"""
 
     def __init__(self, key_id: str, pem_path: str, base_url: str = ENDPOINTS["demo_shared"],
-                 timeout: int = 20):
+                 timeout: int = 20, proxy: Optional[str] = None):
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
 
         self._hashes = hashes
         self._padding = padding
+        key_id = (key_id or "").strip()
+        if not key_id:
+            raise ValueError("API Key ID 不能为空")
         self.key_id = key_id
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.proxy = proxy
 
         with open(pem_path, "rb") as f:
             self.private_key = serialization.load_pem_private_key(f.read(), password=None)
 
         self.session = requests.Session()
         self.session.headers["Content-Type"] = "application/json"
+        if proxy:
+            # socks5h://... 由代理端解析域名，适合直连不通的 Kalshi 域名
+            self.session.proxies.update({"http": proxy, "https": proxy})
 
     # ==== 签名 ====
     def _sign(self, method: str, path: str) -> dict:
@@ -85,7 +92,14 @@ class KalshiClient:
                                     json=json_body,
                                     timeout=self.timeout if timeout is None else timeout)
         if resp.status_code >= 400:
-            raise KalshiHTTPError(method, path, resp.status_code, resp.text or "")
+            text = resp.text or ""
+            if resp.status_code == 401:
+                text += ("\n提示：生产与模拟（Demo）环境的 API Key 互不通用，"
+                         "请确认 Key ID 与私钥在同一环境创建（demo.kalshi.co 创建的 Key 只能用于模拟环境），"
+                         "且两者一一对应。")
+            elif resp.status_code == 429:
+                text += "\n提示：请求过于频繁触发 Kalshi 限流，请稍后重试（自动刷新会暂停 10 秒）。"
+            raise KalshiHTTPError(method, path, resp.status_code, text)
         return resp.json() if resp.text else {}
 
     # ==== 市场数据 ====
@@ -197,16 +211,18 @@ class KalshiClient:
 
     def iter_orders(self, status: str = None, ticker: str = None,
                     event_ticker: str = None, limit: int = 200,
-                    max_pages: int = 30, min_ts: int = None,
+                    max_pages: Optional[int] = 30, min_ts: int = None,
                     timeout: float = None) -> Iterator[dict]:
         """分页迭代订单（Kalshi 限流/瞬时可能返回 orders=null，跳过该页不崩溃）
 
-        账户历史订单会累积（canceled/executed 在 historical cutoff 前一直可查），
-        不设上限会拖住主循环，故默认最多翻 max_pages 页并给单页 shorter timeout。
+        账户历史订单会累积（canceled/executed 在 historical cutoff 前一直可查）。
+        max_pages=None 表示一直翻到 cursor 结束，供本地镜像完整同步使用。
         """
         cursor = None
         n = 0
-        for _ in range(max_pages):
+        page_no = 0
+        while max_pages is None or page_no < max_pages:
+            page_no += 1
             page = self.get_orders_page(status=status, ticker=ticker,
                                         event_ticker=event_ticker,
                                         cursor=cursor, limit=limit,

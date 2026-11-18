@@ -205,6 +205,10 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# 本机运行数据（PEM 私钥、登录会话、代理配置，含敏感信息）
+data/
+*.pem
+
 # Ruff stuff:
 .ruff_cache/
 
