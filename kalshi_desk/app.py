@@ -4431,12 +4431,15 @@ class DeskUI:
         limit_ts = deadline or (time.time() + 20 * 60)
         while remaining > 0 and attempts < 4 and time.time() < limit_ts:
             attempts += 1
-            pos = await self._mo_position_of(ticker)
-            if pos is not None:
-                if abs(pos) < 0.5:
-                    remaining = 0
-                    break
-                remaining = int(abs(pos))
+            # 第一次必须真发单：持仓接口有延迟、demo 环境甚至不返回持仓，
+            # 拿它做拦截会导致「撤了单却一单没吃」。第 2 次起才用它防止多卖。
+            if attempts > 1:
+                pos = await self._mo_position_of(ticker)
+                if pos is not None:
+                    if abs(pos) < 0.5:
+                        remaining = 0
+                        break
+                    remaining = int(abs(pos))
             # 逐级加价，最后一次直接按 0.01 扫单，保证一定吃掉
             f, px = await self._mo_flatten(
                 ctx, remaining, level=min(attempts - 1, 3))
@@ -4455,10 +4458,34 @@ class DeskUI:
                 break
             await asyncio.sleep(0.8)
         pos_final = await self._mo_position_of(ticker)
-        if pos_final is not None:
-            remaining = int(abs(pos_final)) if abs(pos_final) >= 0.5 else 0
+        if pos_final is not None and abs(pos_final) >= 0.5:
+            # 交易所仍有持仓 → 以持仓为准（可能成交回报没解析出来）。
+            # 注意：反过来不能用「持仓为 0」判定成功，持仓接口有延迟。
+            remaining = int(abs(pos_final))
             flat_filled = max(0.0, float(qty - remaining))
         return flat_filled, flat_px, remaining
+
+    async def _mo_tp_requote_px(self, ctx: dict) -> Optional[float]:
+        """止盈单撤单后的重挂价：跟到卖腿当前卖一（join ask）。
+
+        原来的目标价是开仓瞬间算的，价格回落之后一直挂着不成交；
+        重挂时贴到当前卖一才有机会成交。拿不到盘口就沿用原目标价。
+        """
+        ticker = ctx["ticker"]
+        sell_action = ctx["action"].replace("buy_", "sell_")
+        try:
+            q = await run.io_bound(self.api.quote, ticker)
+        except Exception as ex:
+            print(f"[momentum] 重挂止盈前拉 quote 失败：{ex}")
+            return None
+        q = q or {}
+        key = "yes_ask" if sell_action == "sell_yes" else "no_ask"
+        px = _num(q.get(key))
+        if px is None:
+            px = _num(ctx.get("sell_price"))
+        if px is None:
+            return None
+        return max(0.01, min(0.99, float(px)))
 
     async def _run_momentum_fill_watcher(self, ctx: dict) -> None:
         """完整一局的状态机：买单挂单 → 买单成交 → 挂止盈卖单 → 止盈卖单终态 → 退出。
@@ -4637,6 +4664,12 @@ class DeskUI:
             cancel_sec = 0.0
         tp_placed_at = time.time()
         last_status = ""
+        # 跨重挂累计：已卖出张数 / 已实现收入 / 当前挂单价 / 当前挂单张数
+        sold_qty = 0.0
+        proceeds = 0.0
+        cur_px = float(ctx["sell_price"])
+        cur_qty = int(tp_count)
+        requotes = 0
         try:
             while time.time() < sell_deadline:
                 await asyncio.sleep(poll_interval)
@@ -4670,27 +4703,75 @@ class DeskUI:
                 ctx["sell_status"] = s_status or "unknown"
                 if s_status:
                     print(f"[momentum] 止盈卖单 {sell_order_id[:12]}… status={s_status} "
-                          f"filled={s_filled:g}/{tp_count}")
+                          f"filled={s_filled:g}/{cur_qty}")
                 # === 4) sell order 进入终态 ===
                 if s_status in tp_terminal:
-                    pnl = ctx["sell_price"] * s_filled - ctx["buy_price"] * buy_filled
+                    pnl = (proceeds + cur_px * s_filled
+                           - ctx["buy_price"] * (sold_qty + s_filled))
                     if s_status in ("executed", "filled"):
                         mo("tp_filled", sell_status=s_status,
                            sell_order_id=sell_order_id,
                            pnl=round(pnl, 4))
                         if mo_writeback and self.api:
                             db.mo_log(env, "TP_FILLED",
-                                      f"{ctx['ticker']} 止盈成交 {s_filled:g}/{tp_count}，"
+                                      f"{ctx['ticker']} 止盈成交 {s_filled:g}/{cur_qty}，"
                                       f"pnl={pnl:+.4f}",
                                       ticker=ctx["ticker"],
                                       detail={"buy_px": ctx["buy_price"],
-                                              "sell_px": ctx["sell_price"],
+                                              "sell_px": cur_px,
+                                              "requotes": requotes,
                                               "pnl": pnl})
                             self.notify(
                                 f"自动动量止盈成交：{ctx['ticker']} {s_filled:g} 张，"
                                 f"pnl={pnl:+.2f}", type="positive")
                     else:
-                        # 止盈卖单被取消/过期：用户手动处理或结算自动派彩
+                        # 卖单被交易所取消/过期/拒绝：只要还有持仓就立刻转吃单，
+                        # 不能只记一条 canceled 把仓位晾在那里。
+                        sold_now = sold_qty + s_filled
+                        remain_now = int(round(tp_count - sold_now))
+                        if remain_now > 0 and not market_closed:
+                            flat_filled, flat_px, left = await self._mo_flatten_until_done(
+                                ctx, remain_now, sell_deadline)
+                            closed_qty = sold_now + flat_filled
+                            pnl2 = (proceeds + cur_px * s_filled
+                                    + flat_px * flat_filled
+                                    - ctx["buy_price"] * closed_qty)
+                            if left > 0:
+                                ctx["state"] = "error"
+                                ctx["error_ts"] = time.time()
+                                ctx["sell_status"] = "flatten_incomplete"
+                                mo("error", sell_status="flatten_incomplete",
+                                   sell_order_id=sell_order_id, pnl=round(pnl2, 4))
+                                if mo_writeback and self.api:
+                                    db.mo_log(
+                                        env, "FLATTEN_INCOMPLETE",
+                                        f"{ticker} 止盈卖单 {s_status} 后仍剩 "
+                                        f"{left} 张未平！已锁定该 ticker",
+                                        ticker=ticker,
+                                        detail={"sell_order_id": sell_order_id,
+                                                "remaining": left})
+                                self.notify(
+                                    f"{ticker} 平仓失败，仍有 {left} 张未平掉！"
+                                    f"请立即到订单页手动处理", type="negative")
+                                return
+                            ctx["sell_status"] = "flattened"
+                            mo("canceled", sell_status="flattened",
+                               sell_order_id=sell_order_id, pnl=round(pnl2, 4))
+                            if mo_writeback and self.api:
+                                db.mo_log(env, "TP_CANCEL_FLATTEN",
+                                          f"{ticker} 止盈卖单 {s_status}，"
+                                          f"转吃单平仓 {flat_filled:g} 张 "
+                                          f"@{flat_px:.2f}，pnl={pnl2:+.4f}",
+                                          ticker=ticker,
+                                          detail={"sell_order_id": sell_order_id,
+                                                  "flat_filled": flat_filled,
+                                                  "flat_px": flat_px})
+                            self.notify(
+                                f"{ticker} 止盈卖单 {s_status}，已转吃单平仓 "
+                                f"{flat_filled:g} 张 @{flat_px:.2f}，pnl={pnl2:+.2f}",
+                                type="warning" if pnl2 < 0 else "positive")
+                            return
+                        # 已无持仓（或市场已结算）：按取消收尾
                         mo("canceled", sell_status=s_status,
                            sell_order_id=sell_order_id)
                         if mo_writeback and self.api:
@@ -4720,7 +4801,7 @@ class DeskUI:
                 if due_cancel:
                     self.notify(
                         f"止盈卖单 {sell_order_id[:12]}… {cancel_sec:.0f}s 未成交，"
-                        f"撤单后市价平仓", type="info")
+                        f"准备撤单重挂", type="info")
                     if not await self._mo_cancel_order(
                             sell_order_id, ticker, "止盈卖单"):
                         continue  # 撤单失败，下一轮重试，绝不裸卖
@@ -4731,27 +4812,60 @@ class DeskUI:
                         continue  # 查不到订单状态，无法确认已撤，下一轮再试
                     if status2 in ("resting", "created", "open"):
                         continue  # 撤单尚未生效（罕见），下一轮再试
-                    if status2 in ("executed", "filled"):
+                    # 把这张单已经成交的部分先计入累计
+                    if s_filled > 0:
+                        sold_qty += s_filled
+                        proceeds += cur_px * s_filled
+                    if status2 in ("executed", "filled") and sold_qty >= tp_count:
                         # 撤单瞬间刚好全部成交
-                        pnl = ctx["sell_price"] * s_filled - ctx["buy_price"] * buy_filled
+                        pnl = proceeds - ctx["buy_price"] * sold_qty
                         ctx["sell_status"] = status2
                         mo("tp_filled", sell_status=status2,
                            sell_order_id=sell_order_id, pnl=round(pnl, 4))
                         if mo_writeback and self.api:
                             db.mo_log(env, "TP_FILLED",
-                                      f"{ticker} 撤单前止盈已成交 {s_filled:g}/{tp_count}，"
+                                      f"{ticker} 撤单前止盈已成交 {sold_qty:g}/{tp_count}，"
                                       f"pnl={pnl:+.4f}", ticker=ticker,
                                       detail={"sell_order_id": sell_order_id,
                                               "pnl": pnl})
                         return
-                    # 撤单成功且仍有剩余持仓 → 以对手价平仓，直到持仓真的归零
-                    flat_filled, flat_px, remaining = await self._mo_flatten_until_done(
-                        ctx, int(tp_count) - int(s_filled), sell_deadline)
-                    closed_qty = s_filled + flat_filled
-                    pnl = (ctx["sell_price"] * s_filled
-                           + flat_px * flat_filled
+                    remaining = int(round(tp_count - sold_qty))
+                    # ---- 先重挂一次止盈单（跟到当前卖一），仍不成交才吃单 ----
+                    if remaining > 0 and requotes < 1:
+                        new_px = await self._mo_tp_requote_px(ctx)
+                        if new_px is not None:
+                            old_id = sell_order_id
+                            new_side, new_yes_px = DeskAPI.to_book(
+                                ctx["action"].replace("buy_", "sell_"), new_px)
+                            new_id = await self._place_momentum_sell(
+                                ctx["buy_order_id"], ticker, new_side,
+                                new_yes_px, remaining, ctx["subaccount"], ctx=ctx)
+                            if new_id:
+                                requotes += 1
+                                sell_order_id = new_id
+                                cur_px = new_px
+                                cur_qty = remaining
+                                tp_placed_at = time.time()
+                                last_status = ""
+                                mo("tp_requoted", sell_order_id=new_id)
+                                if mo_writeback and self.api:
+                                    db.mo_log(
+                                        env, "TP_REQUOTE",
+                                        f"{ticker} 止盈单 {cancel_sec:.0f}s 未成交，"
+                                        f"撤单后按卖一 {new_px:.2f} 重挂 {remaining} 张",
+                                        ticker=ticker,
+                                        detail={"old_order_id": old_id,
+                                                "new_order_id": new_id,
+                                                "new_px": new_px,
+                                                "count": remaining})
+                                continue
+                    # ---- 重挂失败或已重挂过仍不成交 → 吃单平仓，直到持仓归零 ----
+                    flat_filled, flat_px, left = await self._mo_flatten_until_done(
+                        ctx, remaining, sell_deadline)
+                    closed_qty = sold_qty + flat_filled
+                    pnl = (proceeds + flat_px * flat_filled
                            - ctx["buy_price"] * closed_qty)
-                    if remaining > 0:
+                    if left > 0:
                         # 仓位没平干净：绝不能当成已结束，锁住该 ticker 等人工处理
                         ctx["state"] = "error"
                         ctx["error_ts"] = time.time()
@@ -4762,15 +4876,15 @@ class DeskUI:
                             db.mo_log(
                                 env, "FLATTEN_INCOMPLETE",
                                 f"{ticker} 止盈单 {cancel_sec:.0f}s 未成交，撤单后"
-                                f"仅平掉 {flat_filled:g}/{tp_count} 张，"
-                                f"仍剩 {remaining} 张未平！已锁定该 ticker",
+                                f"仅平掉 {flat_filled:g}/{remaining} 张，"
+                                f"仍剩 {left} 张未平！已锁定该 ticker",
                                 ticker=ticker,
                                 detail={"sell_order_id": sell_order_id,
-                                        "remaining": remaining,
+                                        "remaining": left,
                                         "closed_qty": closed_qty,
                                         "pnl": pnl})
                         self.notify(
-                            f"{ticker} 平仓失败，仍有 {remaining} 张未平掉！"
+                            f"{ticker} 平仓失败，仍有 {left} 张未平掉！"
                             f"请立即到订单页手动处理", type="negative")
                         return
                     ctx["sell_status"] = "flattened"
