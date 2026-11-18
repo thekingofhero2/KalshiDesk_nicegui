@@ -72,6 +72,7 @@ MO_DEFAULT = {
     "tp_cf_max": 1.10,             # 动态止盈倍率上限
     "frac_start": 0.1333,          # 市场生命周期进度下限（15 分钟市场≈第 2 分钟）
     "frac_end": 0.9333,            # 市场生命周期进度上限（15 分钟市场≈结束前 1 分钟）
+    "window_sec": 60,              # 动量检测窗口（秒）
 }
 
 
@@ -120,7 +121,8 @@ def _normalize_mo(mo) -> dict:
     # 数值字段兜底
     for key in ("min_delta", "scan_interval", "taker_interval", "qty",
                 "tp_mult", "subaccount", "max_parallel", "stop_loss",
-                "cancel_sec", "tp_cf_max", "frac_start", "frac_end"):
+                "cancel_sec", "tp_cf_max", "frac_start", "frac_end",
+                "window_sec"):
         try:
             d[key] = float(d[key])
         except (TypeError, ValueError):
@@ -130,6 +132,7 @@ def _normalize_mo(mo) -> dict:
     d["taker_interval"] = max(0, int(d["taker_interval"]))
     d["max_parallel"] = max(1, int(d["max_parallel"]))
     d["cancel_sec"] = max(3, min(600, int(d["cancel_sec"])))
+    d["window_sec"] = max(10, min(900, int(d["window_sec"])))
     d["tp_mult"] = max(1.01, min(3.0, d["tp_mult"]))
     d["tp_cf_boost"] = bool(d.get("tp_cf_boost"))
     d["tp_cf_max"] = max(d["tp_mult"], min(3.0, d["tp_cf_max"]))

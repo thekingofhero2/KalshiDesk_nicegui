@@ -5237,7 +5237,8 @@ class DeskUI:
         if frac is not None and not (cfg["frac_start"] <= frac <= cfg["frac_end"]):
             return False
         # 动量检测
-        direction, delta = await self._detect_momentum(ticker)
+        direction, delta = await self._detect_momentum(
+            ticker, int(cfg.get("window_sec") or 60))
         abs_delta = abs(delta)
         strength = "强" if abs_delta >= 0.03 else ("中" if abs_delta >= 0.01 else "弱")
         threshold_map = {"弱": 0.00, "中": 0.01, "强": 0.03}
@@ -5532,6 +5533,9 @@ class DeskUI:
                     self.cfg_scan = ui.number("扫描间隔(秒)",
                                               value=self.mo_cfg["scan_interval"],
                                               min=2).classes("w-full")
+                    self.cfg_window = ui.number(
+                        "动量窗口(秒)", value=self.mo_cfg["window_sec"],
+                        min=10, max=900).classes("w-full")
                     self.cfg_cool = ui.number("冷却(秒)",
                                              value=self.mo_cfg["taker_interval"],
                                              min=0).classes("w-full")
@@ -5635,6 +5639,7 @@ class DeskUI:
                 "frac_end": float(self.cfg_frac_end.value
                                   if self.cfg_frac_end.value is not None else 0.9333),
                 "scan_interval": int(self.cfg_scan.value or 5),
+                "window_sec": int(self.cfg_window.value or 60),
                 "taker_interval": int(self.cfg_cool.value or 60),
                 "max_parallel": int(self.cfg_max.value or 3),
                 "cancel_sec": int(self.cfg_cancel.value or 30),
