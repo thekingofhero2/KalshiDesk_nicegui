@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from uuid import uuid4
 
@@ -465,7 +465,12 @@ def market_trades_range(env: str, ticker: str,
                         start_ts: Optional[int] = None,
                         end_ts: Optional[int] = None,
                         limit: int = 200000) -> list:
-    """某 ticker 在指定时间区间内的全部成交，按时间升序返回（按秒聚合用）。"""
+    """某 ticker 在指定时间区间内的成交，按时间升序返回（按秒聚合用）。
+
+    先取区间内**最新**的 limit 笔再翻回升序：早期实现是 ORDER BY ts ASC
+    LIMIT，区间成交笔数超过 limit 时会把最新的成交丢掉，动量检测就会拿到
+    一小时前的老价格。
+    """
     sql = ("SELECT trade_id, ticker, price, count, side, ts FROM market_trades "
            "WHERE env=? AND ticker=?")
     params: list = [env, ticker]
@@ -475,9 +480,11 @@ def market_trades_range(env: str, ticker: str,
     if end_ts is not None:
         sql += " AND ts <= ?"
         params.append(int(end_ts))
-    sql += " ORDER BY ts ASC LIMIT ?"
+    sql += " ORDER BY ts DESC LIMIT ?"
     params.append(int(limit))
-    return _query(sql, params)
+    rows = _query(sql, params)
+    rows.reverse()
+    return rows
 
 
 def market_trades_latest(env: str, tickers: Optional[list] = None) -> dict:
@@ -1116,20 +1123,26 @@ def mo_analytics(env: str, days: int = 30,
 
 
 def mo_stats(env: str, since_hours: float = 24.0) -> dict:
-    """汇总近 N 小时动量单统计：总数 / 成交 / 止盈 / 胜率 / pnl / 平均 Δ。"""
+    """汇总近 N 小时动量单统计：总数 / 成交 / 止盈 / 胜率 / pnl / 平均 Δ。
+
+    时间下限用 Python 算好再当参数传入：DuckDB 不接受
+    `INTERVAL 24.0 HOUR` 这种浮点字面量，会直接抛 Parser Error，
+    导致动量面板的定时刷新在第一步就中断（日志表永远不更新）。
+    """
     try:
         h = float(since_hours)
     except (TypeError, ValueError):
         h = 24.0
-    sql = (f"SELECT COUNT(*) AS total, "
-           f"COUNT(CASE WHEN state='tp_filled' THEN 1 END) AS wins, "
-           f"COUNT(CASE WHEN state='buy_filled' THEN 1 END) AS buys_filled, "
-           f"COUNT(CASE WHEN state='tp_placed' THEN 1 END) AS tps_resting, "
-           f"COUNT(CASE WHEN state='canceled' THEN 1 END) AS canceled, "
-           f"SUM(CASE WHEN state='tp_filled' THEN pnl ELSE 0 END) AS total_pnl, "
-           f"AVG(delta) AS avg_delta "
-           f"FROM mo_trades WHERE env=? AND created_ts >= NOW() - INTERVAL {h} HOUR")
-    rows = _query(sql, [env])
+    cutoff = datetime.now() - timedelta(hours=h)
+    sql = ("SELECT COUNT(*) AS total, "
+           "COUNT(CASE WHEN state='tp_filled' THEN 1 END) AS wins, "
+           "COUNT(CASE WHEN state='buy_filled' THEN 1 END) AS buys_filled, "
+           "COUNT(CASE WHEN state='tp_placed' THEN 1 END) AS tps_resting, "
+           "COUNT(CASE WHEN state='canceled' THEN 1 END) AS canceled, "
+           "SUM(CASE WHEN state='tp_filled' THEN pnl ELSE 0 END) AS total_pnl, "
+           "AVG(delta) AS avg_delta "
+           "FROM mo_trades WHERE env=? AND created_ts >= ?")
+    rows = _query(sql, [env, cutoff])
     r = rows[0] if rows else {}
     return {
         "total": int(r.get("total") or 0),

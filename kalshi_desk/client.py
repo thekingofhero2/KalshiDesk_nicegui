@@ -100,7 +100,8 @@ class KalshiClient:
             elif resp.status_code == 429:
                 text += "\n提示：请求过于频繁触发 Kalshi 限流，请稍后重试（自动刷新会暂停 10 秒）。"
             raise KalshiHTTPError(method, path, resp.status_code, text)
-        return resp.json() if resp.text else {}
+        data = resp.json() if resp.text else {}
+        return data if isinstance(data, dict) else {}
 
     # ==== 市场数据 ====
     def get_markets_page(self, series_ticker: str, status: str = None,
