@@ -19,6 +19,7 @@ from uuid import uuid4
 from nicegui import app, events, run, ui
 
 from . import ai as ai_client
+from . import applog
 from . import db, store, ws
 from .api import ACTION_LABEL, ENV_LABEL, ENDPOINTS, DeskAPI
 
@@ -187,6 +188,15 @@ TZ_OPTIONS = {
 }
 
 
+def _mprint(msg: str) -> None:
+    """动量相关调试输出：控制台 + 文件（data/logs/momentum.log）双写。"""
+    print(msg)
+    try:
+        applog.mo().info(msg)
+    except Exception:
+        pass
+
+
 def usd(x: Optional[float], signed: bool = False) -> str:
     if x is None:
         return "—"
@@ -322,6 +332,7 @@ class DeskUI:
     # ================= 页面骨架 =================
     def start(self) -> None:
         ui.dark_mode(True)
+        applog.setup()   # data/logs/momentum.log（同时回显控制台）
         ui.colors(primary="#3ee0a0", positive="#3ee0a0", negative="#ff6b7a",
                   info="#8b93a3")
         ui.add_css(CSS)
@@ -4030,86 +4041,227 @@ class DeskUI:
     # ---------- 动量面板（独立入口，方向/价格全自动） ----------
     async def _detect_momentum(self, ticker: str, window_sec: int = 60,
                                algo: str = "diff") -> tuple[str, float, float]:
-        """检测哪条腿在上涨，返回 (direction, delta, vol)。
+        """检测哪条腿在上涨 —— 使用 rolling K 算法（统一入口，参数已忽略）。
 
-        Kalshi 二元市场 YES 价 + NO 价 = 1，所以 YES 价上涨 ⇔ NO 价下跌：
-          delta > 0 → YES 腿在涨 → buy_yes
-          delta < 0 → NO 腿在涨  → buy_no
+        K = (P_new - P_old) / (T_new - T_old)
+        K > 0 → YES 腿上涨 → buy_yes
+        K < 0 → NO 腿上涨 → buy_no
 
-        algo:
-          diff  —— 窗口内前 20% / 后 20% 成交价均值差（抗单笔插针）
-          slope —— 全部成交点做最小二乘拟合，斜率 × 时间跨度（同样归一到价格变化）
-        vol: 窗口内成交张数合计，用于「按成交量判强弱」。
+        返回 (direction, k, n_trades)：
+          direction: "yes" / "no" / ""（信号不足）
+          k: 最新一 tick 的 K 值（同方向连续至少 2 次才返回有效值，否则 0）
+          n_trades: 参与计算的成交笔数
         """
-        direction, delta, vol = "yes", 0.0, 0.0
+        direction, k_val, n = "", 0.0, 0
         if not (self.api and ticker):
-            return direction, delta, vol
+            return direction, k_val, n
 
-        def _fetch(win: int) -> list:
+        def _fetch() -> list:
             try:
+                # 取最近 10 笔成交（rolling K 只需要连续的 tick 序列）
                 return db.market_trades_range(
-                    self.api.env, ticker, int(time.time() - win), None, 2000) or []
+                    self.api.env, ticker, int(time.time() - 300), None, 200) or []
             except Exception:
                 return []
 
-        # 15 分钟类市场成交稀少：窗口不足 2 笔时自动扩到 300s / 900s
-        rows: list = []
-        for win in (window_sec, max(window_sec, 300), max(window_sec, 900)):
-            rows = await run.io_bound(_fetch, win)
-            if len(rows) >= 2:
-                break
-        if len(rows) < 2:  # 仍不足 → 本轮不触发
-            return direction, delta, vol
-        pts = [float(r["price"]) for r in rows if r.get("price") is not None]
-        if len(pts) < 2:
-            return direction, delta, vol
+        rows = await run.io_bound(_fetch)
+        n = len(rows)
+        if len(rows) < 3:  # 至少要 3 笔才能算出 2 个连续 K
+            return direction, k_val, n
+
+        # 按时间升序，计算 rolling K 序列
+        rows.sort(key=lambda r: r.get("ts", 0))
+        ks: list[float] = []
+        last_p = None
+        last_t = None
         for r in rows:
             try:
-                vol += float(r.get("count") or 0)
-            except (TypeError, ValueError):
-                pass
-        if algo == "slope":
-            delta = self._slope_delta(rows, pts, window_sec)
-        else:
-            k = max(1, int(len(pts) * 0.2))
-            head = sum(pts[:k]) / k
-            tail = sum(pts[-k:]) / k
-            delta = tail - head
-        return ("yes" if delta >= 0 else "no"), delta, vol
+                px = float(r["price"])
+                ts = float(r.get("ts") or 0)
+            except (TypeError, ValueError, KeyError):
+                continue
+            if last_p is None or last_t is None or ts - last_t <= 0:
+                last_p, last_t = px, ts
+                continue
+            k = (px - last_p) / (ts - last_t)
+            ks.append(k)
+            last_p, last_t = px, ts
 
-    @staticmethod
-    def _slope_delta(rows: list, pts: list, window_sec: int) -> float:
-        """最小二乘斜率 × 时间跨度 → 与价差法同量纲（窗口内价格变化）。"""
-        ts: list = []
-        for i, r in enumerate([r for r in rows if r.get("price") is not None]):
+        if len(ks) < 2:
+            return direction, k_val, n
+
+        # 检查最后 2 个 K 是否同方向
+        k_prev = ks[-2]
+        k_curr = ks[-1]
+        if k_prev * k_curr > 0:  # 同方向（都正或都负）
+            direction = "yes" if k_curr > 0 else "no"
+            k_val = k_curr
+
+        return direction, k_val, n
+
+    _MO_SLOPE_SEC = 5.0   # 斜率法只拟合最近 5 秒的成交
+
+    @classmethod
+    def _slope_delta(cls, rows: list) -> float:
+        """只用最近 5 秒的成交做最小二乘拟合 → 斜率 × 实际跨越秒数。
+
+        拟合点要少而新：突破是瞬时行为，把 60s 里的成交都塞进来会把急拉摊平。
+        x 轴用真实时间戳（秒），不是成交笔数。
+        """
+        pairs: list = []
+        for r in rows:
+            if r.get("price") is None:
+                continue
             try:
-                ts.append(float(r.get("ts") or 0))
+                px = float(r["price"])
             except (TypeError, ValueError):
-                ts.append(float(i))
-        if len(ts) != len(pts):
+                continue
+            t = r.get("ts")
+            if isinstance(t, datetime):
+                t = t.timestamp()
+            else:
+                try:
+                    t = float(t)
+                except (TypeError, ValueError):
+                    t = 0.0
+            pairs.append((t, px))
+        if len(pairs) < 2:
             return 0.0
-        t0 = ts[0]
-        xs = [t - t0 for t in ts]
+        if pairs[-1][0] <= 0:      # ts 不可用：退回按最后若干个点拟合
+            pairs = [(float(i), p) for i, (_, p) in enumerate(pairs)]
+        last_t = pairs[-1][0]
+        win = [(t, p) for t, p in pairs if last_t - t <= cls._MO_SLOPE_SEC + 1e-6]
+        if len(win) < 2:
+            return 0.0
+        t0 = win[0][0]
+        xs = [t - t0 for t, _ in win]
+        ys = [p for _, p in win]
         n = len(xs)
-        sx = sum(xs)
-        sy = sum(pts)
+        sx, sy = sum(xs), sum(ys)
         sxx = sum(x * x for x in xs)
-        sxy = sum(x * y for x, y in zip(xs, pts))
+        sxy = sum(x * y for x, y in zip(xs, ys))
         den = n * sxx - sx * sx
         if not den:
             return 0.0
         slope = (n * sxy - sx * sy) / den
-        span = xs[-1] if xs[-1] > 0 else float(window_sec)
+        span = xs[-1] if xs[-1] > 0 else cls._MO_SLOPE_SEC
         return slope * span
 
+    async def _mo_order_sane(self, order_id: str, ticker: str) -> bool:
+        """下单后核对交易所返回的订单归属，防止拿到串号/陈旧订单。
+
+        实测出现过买卖单 id 串号（卖单 id 被回写成下一笔买单 id），
+        一旦串号，状态机会去轮询别人的单，把成交/未成交判错。
+        这里以「订单详情里的 ticker」为准；查不到时不阻塞（避免接口抖动误杀）。
+        """
+        if not (self.api and order_id):
+            return True
+        try:
+            raw = await run.io_bound(self.api.get_order, order_id) or {}
+        except Exception:
+            return True
+        o = raw.get("order") if isinstance(raw, dict) else None
+        if not isinstance(o, dict):
+            o = raw if isinstance(raw, dict) else {}
+        t = str(o.get("ticker") or o.get("market_ticker") or "")
+        if t and t != ticker:
+            return False
+        return True
+
+    async def _mo_spike_metrics(self, ticker: str, cfg: dict) -> dict:
+        """瞬时突破指标：最近一个 spike 窗口的涨跌、量比、连续同向窗口数。
+
+        窗口按「当前时刻往回切」而不是对齐整秒刻度，避免拿到一个刚开头、
+        成交量天然偏小的半截桶，把量比压低成假信号：
+          当前窗 = [now-spike, now]
+          基准窗 = 往前 5 个同样宽度、互不重叠的窗口
+        量比 = 当前窗成交量 / 基准窗均量；run = 从当前窗起连续同向的窗口数。
+        """
+        spike = max(5, int(cfg.get("spike_sec") or 10))
+        out = {"d": 0.0, "vol": 0.0, "ratio": 0.0, "run": 0, "n": 0}
+        if not (self.api and ticker):
+            return out
+
+        def _fetch() -> list:
+            try:
+                return db.market_trades_range(
+                    self.api.env, ticker, int(time.time() - 6 * spike - 30),
+                    None, 20000) or []
+            except Exception:
+                return []
+
+        rows = await run.io_bound(_fetch)
+        out["n"] = len(rows)
+        if len(rows) < 2:
+            return out
+        now = time.time()
+        # 每个窗口: [vol, first_px, last_px, n]
+        wins: dict = {}
+        for r in rows:  # 升序
+            try:
+                ts = float(r.get("ts") or 0)
+                px = float(r["price"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            try:
+                cnt = float(r.get("count") or 0)
+            except (TypeError, ValueError):
+                cnt = 0.0
+            age = max(0.0, now - ts)
+            idx = int(age // spike)
+            w = wins.get(idx)
+            if w is None:
+                wins[idx] = w = [0.0, px, px, 0]
+            w[0] += cnt
+            w[2] = px
+            w[3] += 1
+        cur = wins.get(0)
+        if not cur or cur[3] < 1:
+            return out
+        base_pool = [wins[i][0] for i in range(1, 6) if i in wins]
+        base = sum(base_pool) / len(base_pool) if base_pool else 0.0
+        d = float(cur[2]) - float(cur[1])
+        out["d"] = d
+        out["vol"] = round(cur[0], 2)
+        out["ratio"] = round(cur[0] / base, 3) if base > 0 else (9.99 if cur[0] > 0 else 0.0)
+        sign = 1 if d > 0 else (-1 if d < 0 else 0)
+        # 注意：局部变量不能叫 run —— 本函数前面用了 nicegui 的 run.io_bound，
+        # 一旦同名赋值，Python 会把 run 当局部变量，run.io_bound 直接 UnboundLocalError。
+        streak = 0
+        if sign:
+            for i in range(0, 12):
+                w = wins.get(i)
+                if not w or not w[3]:
+                    break
+                wd = w[2] - w[1]
+                if (wd > 0 and sign > 0) or (wd < 0 and sign < 0):
+                    streak += 1
+                else:
+                    break
+        out["run"] = streak
+        return out
+
     @staticmethod
-    def _mo_strength(delta: float, vol: float, mode: str,
-                     vol_mid: float = 20, vol_strong: float = 100) -> str:
-        """强弱判定：delta=按价格幅度 / volume=按窗口内成交量（张）。"""
-        if mode == "volume":
-            if vol >= vol_strong:
-                return "强"
-            return "中" if vol >= vol_mid else "弱"
+    def _mo_spike_strength(delta: float, ratio: float, streak: int, cfg: dict) -> str:
+        """突破强度：幅度 + 放量倍数 + 连续同向桶数，三者同时满足才算强。
+
+        阈值来自本地 ClickHouse KXBTC15M 两个交易日的数据：
+        - 10s 成交量分位：p50≈3.2万、p90≈8.2万、p99≈24.4万
+        - 量比（当前桶/前5桶均量）分位：p50≈0.94、p90≈1.85、p95≈2.31、p99≈3.98
+        - 10s 涨幅 ≥0.05 后 30s 内再涨 ≥0.02 的概率 ≈58%（无条件约 52%）
+        """
+        vr_mid = float(cfg.get("vr_mid") or 1.8)
+        vr_strong = float(cfg.get("vr_strong") or 2.5)
+        a = abs(delta)
+        if a >= 0.05 and ratio >= vr_strong and streak >= 2:
+            return "强"
+        if a >= 0.02 and ratio >= vr_mid and streak >= 1:
+            return "中"
+        return "弱"
+
+    @staticmethod
+    def _mo_strength(delta: float) -> str:
+        """价差模式的强弱判定（成交量模式走 _mo_spike_strength）。"""
         a = abs(delta)
         return "强" if a >= 0.03 else ("中" if a >= 0.01 else "弱")
 
@@ -4129,6 +4281,16 @@ class DeskUI:
         except (TypeError, ValueError):
             return None
         return px if 0.01 <= px <= 0.99 else None
+
+    @staticmethod
+    def _momentum_tp_abs_px(buy_px: float, off: float) -> float:
+        """止盈价 = 买价 + 绝对价差（美元），保留两位、上限 0.99。
+
+        用绝对价差而不是百分比：15 分钟市场的鱼身约 6~8 分，
+        按 ×1.05 在高价单上会被 0.99 截断、在低价单上又只赚 1~2 分。
+        """
+        tp = round(float(buy_px) + max(0.01, float(off)), 2)
+        return min(0.99, tp)
 
     @staticmethod
     def _momentum_tp_px(buy_px: float, mult: float) -> float:
@@ -4153,30 +4315,31 @@ class DeskUI:
             return None
         return (time.time() - open_ts) / (close_ts - open_ts)
 
-    async def _mo_tp_mult_cf(self, cfg: dict, ticker: str, direction: str,
-                              quote: Optional[dict]) -> float:
-        """参考 cf_benchmark 与水位线（strike）的有利差值动态放大止盈倍率。
+    async def _mo_cf_boost(self, cfg: dict, ticker: str, direction: str,
+                           quote: Optional[dict]) -> float:
+        """参考 cf_benchmark 与水位线（strike）的有利差值，放大止盈价差。
 
-        - 开关关闭 / 非 CF 标的 / 无 strike / 无 CF 快照 → 用基础 tp_mult
-        - 有利偏离（方向校正后）越大，倍率越接近上限 tp_cf_max；
+        返回倍数（≥1.0）：止盈价差 = tp_abs × 该倍数。
+        - 开关关闭 / 非 CF 标的 / 无 strike / 无 CF 快照 → 1.0
+        - 有利偏离（方向校正后）越大，越接近上限 tp_cf_max；
           偏离达到 _MO_CF_RAMP_PCT（strike 的 0.10%）即打满
-        - 不利或零偏离 → 仍用基础 tp_mult
+        - 不利或零偏离 → 1.0
         """
-        base = float(cfg.get("tp_mult") or 1.02)
-        if not cfg.get("tp_cf_boost"):
-            return base
+        cap = max(1.0, float(cfg.get("tp_cf_max") or 1.0))
+        if not cfg.get("tp_cf_boost") or cap <= 1.0:
+            return 1.0
         idx_id = self.cf_index_id_for_ticker(ticker)
         if not idx_id:
-            return base
+            return 1.0
         strike = (quote or {}).get("floor_strike")
         if strike is None:
             strike = self._cf_strike_from_ticker(ticker)
         try:
             strike = float(strike)
         except (TypeError, ValueError):
-            return base
+            return 1.0
         if strike <= 0:
-            return base
+            return 1.0
         cf = ((getattr(self, "cfb_latest", None) or {}).get(idx_id) or {}).get("value")
         if cf is None:
             try:
@@ -4188,7 +4351,7 @@ class DeskUI:
         try:
             cf = float(cf)
         except (TypeError, ValueError):
-            return base
+            return 1.0
         # 方向校正：先算出「YES 腿有利」的距离，再按本次买的是 YES 还是 NO 取符号
         stype = str((quote or {}).get("strike_type") or "").lower()
         yes_favorable = (strike - cf) if ("less" in stype or "below" in stype) \
@@ -4196,27 +4359,80 @@ class DeskUI:
         favorable = yes_favorable if direction == "yes" else -yes_favorable
         pct = favorable / strike * 100.0
         if pct <= 0:
-            return base
-        cap = max(base, float(cfg.get("tp_cf_max") or base))
+            return 1.0
         ratio = min(1.0, pct / self._MO_CF_RAMP_PCT)
-        return base + (cap - base) * ratio
+        return 1.0 + (cap - 1.0) * ratio
+
+    async def _mo_cf_gap_delta(self, ticker: str, direction: str,
+                               quote: Optional[dict], sec: float) -> Optional[dict]:
+        """CF 指数与水位线（strike）的差值斜率。
+
+        gap = 按本次方向校正后的有利差值（越走越有利为正），
+        取最近 sec 秒的 tick 做最小二乘，返回斜率 × 跨度的美元变化量。
+        """
+        idx_id = self.cf_index_id_for_ticker(ticker)
+        if not idx_id:
+            return None
+        strike = (quote or {}).get("floor_strike")
+        if strike is None:
+            strike = self._cf_strike_from_ticker(ticker)
+        try:
+            strike = float(strike)
+        except (TypeError, ValueError):
+            return None
+        if strike <= 0:
+            return None
+        env = self.api.env if self.api else "demo"
+        try:
+            ticks = await run.io_bound(db.cfb_history, env, idx_id, 0.1, 800)
+        except Exception as ex:
+            _mprint(f"[momentum] 拉 CF tick 失败：{ex}")
+            return None
+        now = time.time()
+        stype = str((quote or {}).get("strike_type") or "").lower()
+        less = "less" in stype or "below" in stype
+        pts: list = []
+        for r in ticks or []:
+            try:
+                cf = float(r.get("value"))
+                ts = float(r.get("time_ms")) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if now - ts > sec + 3:
+                continue
+            gap = (strike - cf) if less else (cf - strike)
+            pts.append((ts, gap if direction == "yes" else -gap))
+        if len(pts) < 3:
+            return None
+        t0 = pts[0][0]
+        xs = [t - t0 for t, _ in pts]
+        ys = [g for _, g in pts]
+        n = len(xs)
+        sx, sy = sum(xs), sum(ys)
+        sxx = sum(x * x for x in xs)
+        sxy = sum(x * y for x, y in zip(xs, ys))
+        den = n * sxx - sx * sx
+        d = 0.0 if not den else (n * sxy - sx * sy) / den * xs[-1]
+        return {"d": d, "gap": ys[-1], "age": now - pts[-1][0], "n": n}
 
     def _render_momentum_panel(self) -> None:
         """用已有自检结果重绘动量面板（供输入变化时即时刷新）。"""
         self._paint_momentum(self._mo_dir, self._mo_delta, self._quote)
 
-    def _paint_momentum(self, direction: str, delta: float, quote: Optional[dict]) -> None:
+    def _paint_momentum(self, direction: str, k_val: float, quote: Optional[dict]) -> None:
         label = self._el("mo_dir_label")
         if not label:
             return
-        arrow = "↑" if delta >= 0 else "↓"
-        leg_name = "YES" if direction == "yes" else "NO"
-        strength = ("强" if abs(delta) >= 0.03 else
-                    "中" if abs(delta) >= 0.01 else "弱")
-        label.set_text(f"{leg_name} {arrow} 上涨")
+        has_signal = bool(direction)
+        arrow = "↑" if k_val >= 0 else "↓"
+        leg_name = ("YES 上涨" if direction == "yes" else "NO 上涨") if has_signal else "—"
+        label.set_text(f"{leg_name} {arrow}" if has_signal else "等待信号")
         if el := self._el("mo_trend_label"):
-            el.set_text(f"近 60s Δ{delta:+.3f}（动量{strength}）")
-        buy_px = self._momentum_buy_px(quote or {}, direction)
+            if has_signal:
+                el.set_text(f"K={k_val:+.6f} |K|={abs(k_val):.5f}")
+            else:
+                el.set_text("连续 2 个 K 同方向即触发")
+        buy_px = self._momentum_buy_px(quote or {}, direction or "yes")
         mult_el = self._el("mo_mult_input")
         try:
             mult = float(mult_el.value if mult_el else 1.1) or 1.1
@@ -4235,11 +4451,7 @@ class DeskUI:
             el.set_text(f"止盈 {tp:.2f}（{mult:.2f}×）")
 
     async def _refresh_momentum_panel(self) -> None:
-        """每 2 秒重算动量方向与买/止盈价。
-
-        盘口由 refresh_trade_chart 同一节奏拉取并写入 self._quote，
-        这里不再重复请求 API，避免两条 2s 定时器撞在一起触发 429 限流。
-        """
+        """每 2 秒重算 rolling K 方向与买/止盈价。"""
         if not (self.api and self._el("mo_dir_label") and self.trade_dlg.value):
             return
         ticker = self._trade_chart_ticker
@@ -4247,11 +4459,9 @@ class DeskUI:
             self._mo_dir, self._mo_delta = "yes", 0.0
             self._paint_momentum("yes", 0.0, None)
             return
-        direction, delta, _ = await self._detect_momentum(
-            ticker, int((self.mo_cfg or {}).get("window_sec") or 60),
-            (self.mo_cfg or {}).get("algo") or "diff")
-        self._mo_dir, self._mo_delta = direction, delta
-        self._paint_momentum(direction, delta, self._quote)
+        direction, k_val, _ = await self._detect_momentum(ticker)
+        self._mo_dir, self._mo_delta = direction, k_val
+        self._paint_momentum(direction, k_val, self._quote)
 
     async def reload_quote(self) -> None:
         ticker = (self.tk_select.value or "").strip()
@@ -4387,10 +4597,13 @@ class DeskUI:
             return
         buy_tif = self.tif_toggle.value or "immediate_or_cancel"
         sub = int(self.sub_input.value or 0)
-        # === 1) 下单瞬间重新检测动量方向 ===
-        direction, delta, _ = await self._detect_momentum(
-            ticker, int((self.mo_cfg or {}).get("window_sec") or 60),
-            (self.mo_cfg or {}).get("algo") or "diff")
+        # === 1) 下单瞬间重新检测 rolling K 方向 ===
+        direction, k_val, _ = await self._detect_momentum(ticker)
+        k_thresh = float((self.mo_cfg or {}).get("k_threshold") or 0.03)
+        if not direction or abs(k_val) < k_thresh:
+            self.notify(f"当前 K={k_val:+.6f} 未达阈值 {k_thresh:.3f}，不下单",
+                        type="warning")
+            return
         action = "buy_yes" if direction == "yes" else "buy_no"
         # === 2) 下单瞬间拉最新盘口 → 最新可成交买价 ===
         try:
@@ -4423,7 +4636,7 @@ class DeskUI:
         pnl = count * (sell_price - buy_price)
         leg_name = "YES" if direction == "yes" else "NO"
         summary = (
-            f"【动量买入】{ACTION_LABEL[action]}（{leg_name} 腿上涨 Δ{delta:+.3f}）\n"
+            f"【动量买入】{ACTION_LABEL[action]}（K={k_val:+.6f} |K|={abs(k_val):.5f}）\n"
             f"ticker　{ticker}\n"
             f"买入价 {buy_price:.2f}（最新卖一）　止盈价 {sell_price:.2f}"
             f"（{mult:.2f}×）　数量 {count} 张\n"
@@ -4497,6 +4710,17 @@ class DeskUI:
         sell_status = sell_resp.get("status") or "resting"
         sell_filled = _num(sell_resp.get("fill_count_fp") or sell_resp.get("fill_count")) or 0.0
         sell_order_id = sell_resp.get("order_id") or ""
+        if sell_order_id and ctx is not None and sell_order_id == ctx.get("buy_order_id"):
+            # 串号保护：止盈单 id 与买单相同，说明拿到的不是新订单
+            db.mo_log(self.api.env if self.api else "demo", "ERROR",
+                      f"{ticker} 止盈单 id 与买单相同（疑似串号）：{sell_order_id}",
+                      ticker=ticker)
+            return None
+        if sell_order_id and not await self._mo_order_sane(sell_order_id, ticker):
+            db.mo_log(self.api.env if self.api else "demo", "ERROR",
+                      f"{ticker} 止盈单归属校验失败（疑似串号）：{sell_order_id}",
+                      ticker=ticker)
+            return None
         self.notify(
             f"止盈卖单已挂：side={sell_side} YES价={sell_yes_px:.4f} × {count}\n"
             f"卖单 {sell_order_id}（成交 {sell_filled:g}/{count}，状态 {sell_status}）",
@@ -4551,7 +4775,7 @@ class DeskUI:
         try:
             o = await run.io_bound(self.api.get_order, order_id)
         except Exception as ex:
-            print(f"[momentum] get_order 失败（忽略重试）：{ex}")
+            _mprint(f"[momentum] get_order 失败（忽略重试）：{ex}")
             return "", 0.0
         if not isinstance(o, dict):
             return "", 0.0
@@ -4570,7 +4794,7 @@ class DeskUI:
             if any(k in msg for k in ("not_found", "not found", "already",
                                       "canceled", "cancelled", "filled")):
                 return True
-            print(f"[momentum] 撤{label} {order_id[:12]}… 失败：{ex}")
+            _mprint(f"[momentum] 撤{label} {order_id[:12]}… 失败：{ex}")
             return False
 
     async def _mo_on_buy_filled(self, ctx: dict, mo, status: str,
@@ -4678,17 +4902,15 @@ class DeskUI:
         direction = ctx.get("direction") or "yes"
         _cfg = ctx.get("mo_cfg") or self.mo_cfg or store.MO_DEFAULT
         try:
-            new_dir, delta, _ = await self._detect_momentum(
-                ticker, int(_cfg.get("window_sec") or 60),
-                _cfg.get("algo") or "diff")
+            new_dir, k_val, _ = await self._detect_momentum(ticker)
         except Exception:
             return False
-        if new_dir != direction or abs(delta) < 0.01:
+        if new_dir != direction or abs(k_val) < float(_cfg.get("k_threshold") or 0.03):
             return False
         try:
             live = await run.io_bound(self.api.quote, ticker)
         except Exception as ex:
-            print(f"[momentum] 重挂前拉 quote 失败：{ex}")
+            _mprint(f"[momentum] 重挂前拉 quote 失败：{ex}")
             return False
         mkt_status = (live or {}).get("status")
         if mkt_status and mkt_status != "active":
@@ -4696,9 +4918,9 @@ class DeskUI:
         buy_px = self._momentum_buy_px(live or {}, direction)
         if buy_px is None:
             return False
-        tp_mult = await self._mo_tp_mult_cf(
-            ctx.get("_mo_cfg") or {}, ticker, direction, live)
-        sell_px = self._momentum_tp_px(buy_px, tp_mult)
+        tp_off = float((ctx.get("_mo_cfg") or {}).get("tp_abs") or 0.06) * \
+            await self._mo_cf_boost(ctx.get("_mo_cfg") or {}, ticker, direction, live)
+        sell_px = self._momentum_tp_abs_px(buy_px, tp_off)
         if sell_px <= buy_px:
             return False
         action = ctx["action"]
@@ -4760,7 +4982,7 @@ class DeskUI:
             q = await run.io_bound(self.api.quote, ticker)
             px = DeskAPI.best_price(q or {}, sell_action)
         except Exception as ex:
-            print(f"[momentum] 平仓前拉 quote 失败：{ex}")
+            _mprint(f"[momentum] 平仓前拉 quote 失败：{ex}")
         try:
             px = float(px) if px is not None else 0.01
         except (TypeError, ValueError):
@@ -4816,7 +5038,7 @@ class DeskUI:
         try:
             rows = await run.io_bound(self.api.positions)
         except Exception as ex:
-            print(f"[momentum] 查持仓失败：{ex}")
+            _mprint(f"[momentum] 查持仓失败：{ex}")
             return None
         for p in rows or []:
             if p.get("ticker") == ticker:
@@ -4873,37 +5095,17 @@ class DeskUI:
             flat_filled = max(0.0, float(qty - remaining))
         return flat_filled, flat_px, remaining
 
-    async def _mo_tp_requote_px(self, ctx: dict) -> Optional[float]:
-        """止盈单撤单后的重挂价：跟到卖腿当前卖一（join ask）。
-
-        原来的目标价是开仓瞬间算的，价格回落之后一直挂着不成交；
-        重挂时贴到当前卖一才有机会成交。拿不到盘口就沿用原目标价。
-        """
-        ticker = ctx["ticker"]
-        sell_action = ctx["action"].replace("buy_", "sell_")
-        try:
-            q = await run.io_bound(self.api.quote, ticker)
-        except Exception as ex:
-            print(f"[momentum] 重挂止盈前拉 quote 失败：{ex}")
-            return None
-        q = q or {}
-        key = "yes_ask" if sell_action == "sell_yes" else "no_ask"
-        px = _num(q.get(key))
-        if px is None:
-            px = _num(ctx.get("sell_price"))
-        if px is None:
-            return None
-        return max(0.01, min(0.99, float(px)))
-
     async def _run_momentum_fill_watcher(self, ctx: dict) -> None:
         """完整一局的状态机：买单挂单 → 买单成交 → 挂止盈卖单 → 止盈卖单终态 → 退出。
 
         关键约束（用户确认的铁律）：
           只有止盈卖单进入终态（成交/取消/过期/结算消失），这一局才算关闭，
           引擎才允许在同 ticker 开下一局。watcher 在此之前不 pop。
+          买单超时未成交 → 按 cancel_sec 撤单（可重挂）；止盈单不看时长，
+          只在最新成交价跌破止损线时撤单并吃单平仓。
         撤单逻辑（仅机器人单，传了 mo_cfg 才启用）：
           买单超过 cancel_sec 未成交 → 撤单，动量仍在则按最新价追价重挂（最多 3 次）；
-          止盈单超过 cancel_sec 未成交 → 撤单并立即以对手价市价平仓。
+          止盈单不看时长 → 最新成交价 ≤ 买价 - sl_abs 时撤单并吃单平仓。
         """
         ticker = ctx["ticker"]
         count = ctx["count"]
@@ -4937,7 +5139,7 @@ class DeskUI:
                 status, filled = await self._mo_order_state(oid)
                 if not status:
                     continue
-                print(f"[momentum] 买单 {oid[:12]}… status={status} "
+                _mprint(f"[momentum] 买单 {oid[:12]}… status={status} "
                       f"filled={filled:g}/{count}")
                 # === 买单全成交 → 挂止盈卖单，进入阶段 2 ===
                 if status in ("executed", "filled") or filled >= count:
@@ -5036,14 +5238,40 @@ class DeskUI:
                     if v is ctx:
                         self._momentum_watchers.pop(k, None)
 
+    async def _mo_last_leg_px(self, ticker: str, direction: str,
+                              lookback: int = 180) -> Optional[float]:
+        """最新一笔成交换算成「持仓腿」的价格（YES 腿直接用，NO 腿取 1-价格）。"""
+        if not (self.api and ticker):
+            return None
+
+        def _fetch() -> Optional[dict]:
+            try:
+                rows = db.market_trades_range(
+                    self.api.env, ticker, int(time.time() - lookback), None, 50) or []
+            except Exception:
+                return None
+            return rows[-1] if rows else None
+
+        row = await run.io_bound(_fetch)
+        if not row:
+            return None
+        try:
+            yes_px = float(row["price"])
+        except (TypeError, ValueError, KeyError):
+            return None
+        if yes_px <= 0 or yes_px >= 1:
+            return None
+        return yes_px if direction == "yes" else round(1.0 - yes_px, 4)
+
     async def _run_tp_watch(self, ctx: dict, sell_order_id: str,
                              buy_filled: float, tp_count: int,
                              mo) -> None:
         """阶段 2：轮询止盈卖单直到终态。
 
-        关键：deadline 不是固定值，是 ticker 自身的 close_time（市场结算时间）。
-        市场结算后交易所会自动取消所有未成交挂单、按结果派彩持仓。
-        所以 close_time 一到，不管 sell order 状态是什么，这一局都必须结束。
+        - 止盈单**不看时间**：一直挂着，直到成交 / 市场结算 / 触发止损。
+        - 止损由最新成交价决定：最新一笔成交换算成持仓腿价格后
+          <= 买价 - sl_abs（默认 0.04）时，立刻撤止盈单并吃单平仓。
+        - deadline 用 ticker 自身 close_time：结算后交易所会自动撤单并派彩。
         """
         env = self.api.env if self.api else "demo"
         ticker = ctx["ticker"]
@@ -5060,17 +5288,23 @@ class DeskUI:
             # 拿不到 close_time（比如一次性 one_off 市场），兜底 30min
             sell_deadline = time.time() + 30 * 60
             if close_ts is not None:
-                print(f"[momentum] {ticker} close_time 已过期（{close_ts}），"
+                _mprint(f"[momentum] {ticker} close_time 已过期（{close_ts}），"
                       f"市场可能已结算，给 2min grace")
                 sell_deadline = time.time() + 2 * 60
-        poll_interval = 5.0
+        poll_interval = 2.0
         tp_terminal = {"executed", "filled", "canceled", "expired", "rejected"}
         mo_cfg = ctx.get("_mo_cfg") or {}
+        direction = "yes" if str(ctx.get("action") or "").endswith("yes") else "no"
         try:
-            cancel_sec = float(mo_cfg.get("cancel_sec") or 0) if mo_cfg else 0.0
+            sl_abs = float(mo_cfg.get("sl_abs") or 0.0)
         except (TypeError, ValueError):
-            cancel_sec = 0.0
-        tp_placed_at = time.time()
+            sl_abs = 0.0
+        stop_level = round(float(ctx["buy_price"]) - sl_abs, 2) if sl_abs > 0 else 0.0
+        if sl_abs > 0:
+            _mprint(f"[momentum] {ticker} 止盈无时间撤单，止损线={stop_level:.2f}"
+                    f"（买价 {float(ctx['buy_price']):.2f} - {sl_abs:.2f}）")
+        else:
+            _mprint(f"[momentum] {ticker} 止盈无时间撤单，止损已禁用（只止盈）")
         last_status = ""
         # 跨重挂累计：已卖出张数 / 已实现收入 / 当前挂单价 / 当前挂单张数
         sold_qty = 0.0
@@ -5088,7 +5322,7 @@ class DeskUI:
                     if isinstance(s, dict):
                         s_status = (s.get("status") or "").lower()
                 except Exception as ex:
-                    print(f"[momentum] tp get_order 失败（忽略重试）：{ex}")
+                    _mprint(f"[momentum] tp get_order 失败（忽略重试）：{ex}")
                     continue
                 s_filled = 0.0
                 if s_status:
@@ -5102,15 +5336,20 @@ class DeskUI:
                         market_closed = True
                 except Exception:
                     pass
-                due_cancel = (cancel_sec > 0 and not market_closed
-                              and s_status not in tp_terminal
-                              and time.time() - tp_placed_at >= cancel_sec)
-                if s_status == last_status and not market_closed and not due_cancel:
+                # 止损判定：sl_abs > 0 时才启用，且最新一笔成交（持仓腿价格）<= 买价 - sl_abs
+                latest_px = None
+                if s_status not in tp_terminal and not market_closed:
+                    latest_px = await self._mo_last_leg_px(ticker, direction)
+                stop_hit = (sl_abs > 0 and not market_closed
+                            and s_status not in tp_terminal
+                            and latest_px is not None
+                            and latest_px <= stop_level)
+                if s_status == last_status and not market_closed and not stop_hit:
                     continue
                 last_status = s_status
                 ctx["sell_status"] = s_status or "unknown"
                 if s_status:
-                    print(f"[momentum] 止盈卖单 {sell_order_id[:12]}… status={s_status} "
+                    _mprint(f"[momentum] 止盈卖单 {sell_order_id[:12]}… status={s_status} "
                           f"filled={s_filled:g}/{cur_qty}")
                 # === 4) sell order 进入终态 ===
                 if s_status in tp_terminal:
@@ -5205,11 +5444,13 @@ class DeskUI:
                         f"{ctx['ticker']} 市场已结算，止盈卖单未成交（pnl 由结算决定）",
                         type="info")
                     return
-                # === 5.5) 止盈单超过 cancel_sec 未成交 → 撤单 + 立即市价平仓 ===
-                if due_cancel:
+                # === 5.5) 触发止损 → 撤止盈单 + 立即吃单平仓（不看挂单时长）===
+                if stop_hit:
+                    _mprint(f"[momentum] {ticker} 触发止损：最新 {latest_px:.2f} "
+                            f"≤ 止损线 {stop_level:.2f}")
                     self.notify(
-                        f"止盈卖单 {sell_order_id[:12]}… {cancel_sec:.0f}s 未成交，"
-                        f"准备撤单重挂", type="info")
+                        f"{ticker} 触发止损：最新成交 {latest_px:.2f} ≤ "
+                        f"止损线 {stop_level:.2f}，撤单后吃单平仓", type="warning")
                     if not await self._mo_cancel_order(
                             sell_order_id, ticker, "止盈卖单"):
                         continue  # 撤单失败，下一轮重试，绝不裸卖
@@ -5238,36 +5479,7 @@ class DeskUI:
                                               "pnl": pnl})
                         return
                     remaining = int(round(tp_count - sold_qty))
-                    # ---- 先重挂一次止盈单（跟到当前卖一），仍不成交才吃单 ----
-                    if remaining > 0 and requotes < 1:
-                        new_px = await self._mo_tp_requote_px(ctx)
-                        if new_px is not None:
-                            old_id = sell_order_id
-                            new_side, new_yes_px = DeskAPI.to_book(
-                                ctx["action"].replace("buy_", "sell_"), new_px)
-                            new_id = await self._place_momentum_sell(
-                                ctx["buy_order_id"], ticker, new_side,
-                                new_yes_px, remaining, ctx["subaccount"], ctx=ctx)
-                            if new_id:
-                                requotes += 1
-                                sell_order_id = new_id
-                                cur_px = new_px
-                                cur_qty = remaining
-                                tp_placed_at = time.time()
-                                last_status = ""
-                                mo("tp_requoted", sell_order_id=new_id)
-                                if mo_writeback and self.api:
-                                    db.mo_log(
-                                        env, "TP_REQUOTE",
-                                        f"{ticker} 止盈单 {cancel_sec:.0f}s 未成交，"
-                                        f"撤单后按卖一 {new_px:.2f} 重挂 {remaining} 张",
-                                        ticker=ticker,
-                                        detail={"old_order_id": old_id,
-                                                "new_order_id": new_id,
-                                                "new_px": new_px,
-                                                "count": remaining})
-                                continue
-                    # ---- 重挂失败或已重挂过仍不成交 → 吃单平仓，直到持仓归零 ----
+                    # 止损不看时长：撤掉止盈单后直接吃单，不再重挂
                     flat_filled, flat_px, left = await self._mo_flatten_until_done(
                         ctx, remaining, sell_deadline)
                     closed_qty = sold_qty + flat_filled
@@ -5283,7 +5495,8 @@ class DeskUI:
                         if mo_writeback and self.api:
                             db.mo_log(
                                 env, "FLATTEN_INCOMPLETE",
-                                f"{ticker} 止盈单 {cancel_sec:.0f}s 未成交，撤单后"
+                                f"{ticker} 触发止损（最新 {latest_px:.2f} ≤ "
+                                f"止损线 {stop_level:.2f}），撤单后"
                                 f"仅平掉 {flat_filled:g}/{remaining} 张，"
                                 f"仍剩 {left} 张未平！已锁定该 ticker",
                                 ticker=ticker,
@@ -5299,15 +5512,16 @@ class DeskUI:
                     mo("canceled", sell_status="flattened",
                        sell_order_id=sell_order_id, pnl=round(pnl, 4))
                     if mo_writeback and self.api:
-                        db.mo_log(env, "TP_CANCEL_FLATTEN",
-                                  f"{ticker} 止盈单 {cancel_sec:.0f}s 未成交，撤单后"
+                        db.mo_log(env, "TP_STOP_FLATTEN",
+                                  f"{ticker} 触发止损（最新 {latest_px:.2f} ≤ "
+                                  f"止损线 {stop_level:.2f}），撤单后"
                                   f"市价平仓 {flat_filled:g} 张 @{flat_px:.2f}，"
                                   f"pnl={pnl:+.4f}", ticker=ticker,
                                   detail={"sell_order_id": sell_order_id,
                                           "flat_filled": flat_filled,
                                           "flat_px": flat_px})
                     self.notify(
-                        f"{ticker} 止盈单撤单后市价平仓 {flat_filled:g} 张 "
+                        f"{ticker} 触发止损，已平仓 {flat_filled:g} 张 "
                         f"@{flat_px:.2f}，pnl={pnl:+.2f}",
                         type="warning" if pnl < 0 else "positive")
                     return
@@ -5322,7 +5536,7 @@ class DeskUI:
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            print(f"[momentum] _run_tp_watch 异常：{ex}")
+            _mprint(f"[momentum] _run_tp_watch 异常：{ex}")
 
     @staticmethod
     def _parse_close_time(raw) -> Optional[float]:
@@ -5376,6 +5590,14 @@ class DeskUI:
         self._mo_log_safe("INFO", "动量机器人启动",
                           detail={"scan_interval": self.mo_cfg["scan_interval"],
                                   "series": self.mo_cfg.get("series") or []})
+        self._mlog(f"START env={self.api.env} "
+                   f"算法=Rolling K 阈值={self.mo_cfg.get('k_threshold')} "
+                   f"frac=[{self.mo_cfg.get('frac_start')},{self.mo_cfg.get('frac_end')}] "
+                   f"止盈+{self.mo_cfg.get('tp_abs')} 止损-{self.mo_cfg.get('sl_abs')} "
+                   f"K加成×{self.mo_cfg.get('tp_k_mult')} "
+                   f"扫描={self.mo_cfg.get('scan_interval')}s "
+                   f"张数={self.mo_cfg.get('qty')} "
+                   f"并行≤{self.mo_cfg.get('max_parallel')}")
         self._sync_mo_ui(running=True)
         # 动量检测依赖本地成交数据：把监控系列加入 WS 订阅（增量，不影响用户在
         # 数据订阅页已选的系列），使其下活跃市场成交自动落库。
@@ -5389,7 +5611,18 @@ class DeskUI:
             env = self.api.env if self.api else "demo"
             db.mo_log(env, level, message, ticker=ticker, detail=detail)
         except Exception as ex:
-            print(f"[momentum] 写日志失败（忽略）：{ex}")
+            _mprint(f"[momentum] 写日志失败（忽略）：{ex}")
+        # 事件类日志同时落文件（TRADE / ERROR / WARN / INFO），面板刷不出来也能追踪
+        if level != "DEBUG":
+            self._mlog(f"{level:<5} {ticker or '-'} {message}")
+
+    @staticmethod
+    def _mlog(message: str) -> None:
+        """写文件日志 data/logs/momentum.log（同时回显控制台），失败绝不影响主流程。"""
+        try:
+            applog.mo().info(message)
+        except Exception:
+            pass
 
     def _sync_mo_ui(self, running: bool) -> None:
         """把模块级引擎状态同步到当前页面的面板元素（元素可能已销毁）。"""
@@ -5446,6 +5679,7 @@ class DeskUI:
             task.cancel()
         _MO_ENGINE["task"] = None
         self._mo_log_safe("INFO", "动量机器人停止")
+        self._mlog("STOP  动量机器人停止")
         self._sync_mo_ui(running=False)
         self.notify("动量机器人已停止（已挂的 watcher 继续生效直到止盈/取消）",
                     type="info")
@@ -5471,6 +5705,7 @@ class DeskUI:
                 except asyncio.CancelledError:
                     raise
                 except Exception as ex:
+                    self._mlog(f"ERROR 扫描轮次异常：{ex}")
                     db.mo_log(env, "ERROR", f"扫描轮次异常：{ex}")
                 await asyncio.sleep(max(2, int(cfg.get("scan_interval") or 5)))
         except asyncio.CancelledError:
@@ -5478,6 +5713,7 @@ class DeskUI:
                 db.mo_log(self.api.env, "INFO", "动量引擎协程被取消")
         except Exception as ex:
             _MO_ENGINE["running"] = False
+            self._mlog(f"ERROR 动量引擎异常终止：{ex}")
             db.mo_log(self.api.env if self.api else "demo",
                       "ERROR", f"动量引擎异常终止：{ex}")
 
@@ -5515,6 +5751,9 @@ class DeskUI:
                     "WARN", f"{c.get('ticker')} watcher 异常已超 30 分钟，"
                             f"强制释放该系列（请核对持仓）", ticker=c.get("ticker", ""))
         candidates = await ui._mo_collect_tickers(cfg)
+        ui._mlog(f"SCAN  候选={len(candidates)} "
+                 f"{[t for t, _ in candidates][:6]} "
+                 f"watchers={len(_MO_ENGINE['watchers'])}/{cfg['max_parallel']}")
         if not candidates:
             return
         # 交易所真实持仓：有持仓的 ticker 绝不再开新仓，
@@ -5543,7 +5782,7 @@ class DeskUI:
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
-                db.mo_log(env, "ERROR", f"扫描 {ticker} 异常：{ex}", ticker=ticker)
+                ui._mo_log_safe("ERROR", f"扫描 {ticker} 异常：{ex}", ticker=ticker)
 
     async def _mo_collect_tickers(self, cfg: dict) -> list[tuple[str, str]]:
         """候选市场 ticker：把配置的「系列」展开成当前活跃的市场 ticker。
@@ -5591,16 +5830,22 @@ class DeskUI:
         """
         env = self.api.env
         now = time.time()
+
+        def _skip(reason: str) -> bool:
+            """记录本轮未开单的原因（只写文件，不写库，避免每秒刷屏）。"""
+            self._mlog(f"SKIP  {ticker} {reason}")
+            return False
+
         # 冷却期
         cooldown_until = self._mo_cooldown_until.get(ticker, 0)
         if now < cooldown_until:
-            return False
+            return _skip(f"冷却中 剩余{cooldown_until - now:.0f}s")
         # ---- 判据 0：交易所真实持仓 ----
         # 只要这个 ticker 还有仓位，就绝不开新仓（库内记录可能是错的）
         if held and ticker in held:
             db.mo_log(env, "DEBUG",
                       f"{ticker} 交易所仍有持仓，跳过开新仓", ticker=ticker)
-            return False
+            return _skip("交易所仍有持仓")
         # ---- 判据 1：内存 watcher 同 ticker 去重 ----
         # 跨 ticker（哪怕同 series）= 旧场已滚场结算，不阻塞新 ticker。
         for ctx in self._momentum_watchers.values():
@@ -5609,7 +5854,7 @@ class DeskUI:
                           f"内存 watcher 同 ticker {ticker} "
                           f"（状态 {ctx['state']}），跳过",
                           ticker=ticker)
-                return False
+                return _skip(f"内存 watcher 在途（{ctx['state']}）")
         # ---- 判据 2：DB 未完成记录兜底（仅同 ticker 才阻塞） ----
         try:
             opens = await run.io_bound(db.mo_open_by_ticker, env, ticker, 60)
@@ -5619,94 +5864,129 @@ class DeskUI:
                           f"同 ticker {ticker} 在库里有未完成单 "
                           f"（{o.get('state')}），跳过",
                           ticker=ticker)
-                return False
+                return _skip(f"库内未完成单（{o.get('state')}）")
         except Exception as ex:
-            db.mo_log(env, "WARN", f"检查同 ticker 未完成单失败：{ex}",
-                      ticker=ticker)
+            self._mo_log_safe("WARN", f"检查同 ticker 未完成单失败：{ex}",
+                              ticker=ticker)
         # 拉最新盘口（状态 / frac 区间 / 定价共用，避免重复请求）
         try:
             live = await run.io_bound(self.api.quote, ticker)
         except Exception as ex:
-            db.mo_log(env, "WARN", f"{ticker} 拉 quote 失败：{ex}", ticker=ticker)
+            self._mo_log_safe("WARN", f"{ticker} 拉 quote 失败：{ex}", ticker=ticker)
             return False
         status = (live or {}).get("status")
         if status and status != "active":
-            return False
+            return _skip(f"市场状态 {status}")
         # ---- frac 区间：只在市场生命周期 [frac_start, frac_end] 内开单 ----
         frac = self._mo_market_frac(live or {})
         if frac is not None and not (cfg["frac_start"] <= frac <= cfg["frac_end"]):
-            return False
-        # 动量检测
-        direction, delta, vol = await self._detect_momentum(
-            ticker, int(cfg.get("window_sec") or 60),
-            cfg.get("algo") or "diff")
-        abs_delta = abs(delta)
-        smode = cfg.get("strength_mode") or "delta"
-        strength = self._mo_strength(
-            delta, vol, smode,
-            float(cfg.get("vol_mid") or 20), float(cfg.get("vol_strong") or 100))
-        threshold_map = {"弱": 0.00, "中": 0.01, "强": 0.03}
-        if smode == "volume":
-            # 按成交量判强弱：等级达标 + 价格变化不低于最小 Δ 底线
-            rank = {"弱": 0, "中": 1, "强": 2}
-            if rank.get(strength, 0) < rank.get(cfg["min_strength"], 1):
-                return False
-            if abs_delta < cfg["min_delta"]:
-                return False
-        else:
-            need_min_delta = threshold_map.get(cfg["min_strength"], 0.01)
-            if abs_delta < max(cfg["min_delta"], need_min_delta):
-                return False
+            return _skip(f"frac={frac:.3f} 不在 "
+                         f"[{cfg['frac_start']:.3f},{cfg['frac_end']:.3f}]")
+        # 动量检测：rolling K + 连续 2 个 K 同方向 + |K| ≥ k_threshold
+        k_thresh = float(cfg.get("k_threshold") or 0.03)
+        direction, k_val, n_trades = await self._detect_momentum(ticker)
+        abs_k = abs(k_val)
+        self._mlog(f"EVAL  {ticker} K={k_val:+.6f} 阈值={k_thresh:.3f} "
+                   f"方向={direction or '—'} 样本={n_trades}")
+        if not direction:
+            return _skip(f"K 未连续同向（信号不足）")
+        if abs_k < k_thresh:
+            return _skip(f"|K|={abs_k:.6f} < 阈值={k_thresh:.3f}")
+        # 止盈价 = 买价 + tp_abs + 动量加成
         buy_price = self._momentum_buy_px(live or {}, direction)
         if buy_price is None:
-            return False
-        tp_mult = await self._mo_tp_mult_cf(cfg, ticker, direction, live)
-        sell_price = self._momentum_tp_px(buy_price, tp_mult)
+            return _skip("无卖一价（盘口为空）")
+        tp_abs = float(cfg.get("tp_abs") or 0.06)
+        tp_k_mult = float(cfg.get("tp_k_mult") or 0.0)
+        tp_off = tp_abs + max(0.0, (abs_k - k_thresh)) * tp_k_mult
+        sell_price = self._momentum_tp_abs_px(buy_price, tp_off)
         if sell_price <= buy_price:
-            return False
+            return _skip(f"止盈价{sell_price:.2f} 不高于买价{buy_price:.2f}")
         count = int(cfg["qty"])
         action = "buy_yes" if direction == "yes" else "buy_no"
         buy_side, buy_yes_px = DeskAPI.to_book(action, buy_price)
         sell_action = action.replace("buy_", "sell_")
         sell_side, sell_yes_px = DeskAPI.to_book(sell_action, sell_price)
-        # 挂单
+        # 买单让价重试：先挂 ask → 没吃全就追价（+0.02, +0.04）再 IOC 两次
         buy_order_id = ""
-        try:
-            resp = await run.io_bound(
-                lambda: self.api.place(ticker, buy_side, buy_yes_px, count,
-                                        cfg["buy_tif"], post_only=False,
-                                        subaccount=int(cfg["subaccount"])))
+        bought_px = buy_price      # 最终实际成交价（可能因为追价而更高）
+        letteps = [0.0, 0.02, 0.04]  # 让价梯度：0=ask, +0.02, +0.04
+        for let in letteps:
+            attempt_px = round(buy_price + let, 2)
+            if attempt_px > 0.99:
+                break
+            a_side, a_yes = DeskAPI.to_book(action, attempt_px)
+            try:
+                resp = await run.io_bound(
+                    lambda s=a_side, p=a_yes: self.api.place(
+                        ticker, s, p, count, cfg["buy_tif"],
+                        post_only=False, subaccount=int(cfg["subaccount"]))) or {}
+            except Exception as ex:
+                self._mo_log_safe("ERROR", f"{ticker} 下单失败（让价 +{let:.2f}）：{ex}",
+                                  ticker=ticker, detail={"k": k_val, "attempt_px": attempt_px})
+                continue
             buy_order_id = resp.get("order_id") or ""
-        except Exception as ex:
-            db.mo_log(env, "ERROR", f"{ticker} 下单失败：{ex}", ticker=ticker,
-                      detail={"delta": delta, "buy_px": buy_price, "sell_px": sell_price})
-            return False
+            if not buy_order_id:
+                self._mo_log_safe("WARN", f"{ticker} 买单让价+{let:.2f} 无 order_id：{resp}",
+                                  ticker=ticker)
+                continue
+            filled = _num(resp.get("fill_count_fp") or resp.get("fill_count")) or 0.0
+            if filled >= count * 0.999:  # 全成交（容 0.001 浮点误差）
+                bought_px = attempt_px
+                break
+            # 部分成交但没吃全 → 这张 IOC 订单已结束，继续追价
+            self._mlog(f"RETRY  {ticker} 让价+{let:.2f} 只成交 {filled:g}/{count}，继续追价")
+            # 最后一次尝试仍然没吃全就放弃
+            if let == letteps[-1]:
+                # 最后一次仍有部分成交 → 也开仓（接受部分仓位）
+                bought_px = attempt_px
+                break
+            await asyncio.sleep(0.3)  # 等 300ms 让盘口更新
+        # 所有尝试都没拿到 order_id → 放弃
         if not buy_order_id:
-            db.mo_log(env, "WARN", f"{ticker} 买单无 order_id：{resp}", ticker=ticker)
+            self._mo_log_safe("WARN", f"{ticker} 买单让价三次仍无有效订单，放弃",
+                              ticker=ticker, detail={"k": k_val, "buy_px": buy_price})
             return False
+        if not await self._mo_order_sane(buy_order_id, ticker):
+            self._mo_log_safe("ERROR",
+                f"{ticker} 买单归属校验失败（疑似串号）：{buy_order_id}",
+                ticker=ticker)
+            return False
+        # 让价后按实际买价重新算止盈
+        if bought_px != buy_price:
+            tp_off = float(cfg.get("tp_abs") or 0.06) + max(0.0, (abs_k - k_thresh)) * tp_k_mult
+            sell_price = self._momentum_tp_abs_px(bought_px, tp_off)
+            buy_price = bought_px
+            buy_side, buy_yes_px = DeskAPI.to_book(action, buy_price)
+            sell_side, sell_yes_px = DeskAPI.to_book(
+                action.replace("buy_", "sell_"), sell_price)
+            self._mlog(f"REPRICE  {ticker} 让价后实际买价 {buy_price:.2f} → 止盈 {sell_price:.2f}")
         # 落库：mo_trades 初始态 + mo_log
         db.mo_upsert_trade(env, buy_order_id,
                            ticker=ticker, series=series, direction=direction,
-                           delta=delta, buy_px=buy_price, buy_count=count,
+                           delta=k_val, buy_px=buy_price, buy_count=count,
                            buy_tif=cfg["buy_tif"],
-                           buy_status=resp.get("status") or "resting",
+                           buy_status="executed",
                            sell_px=sell_price, subaccount=int(cfg["subaccount"]),
                            state="buy_placed")
         db.mo_log(env, "TRADE",
                   f"买入 {ACTION_LABEL[action]} {ticker} @{buy_price:.2f} "
-                  f"×{count}，Δ{delta:+.3f} 量{vol:.0f}（动量{strength}）→ 止盈 "
-                  f"{sell_price:.2f}（×{tp_mult:.3f}）",
+                  f"×{count}，K={k_val:+.6f} |K|={abs_k:.5f}"
+                  f" → 止盈 {sell_price:.2f}（+{tp_off:.2f}）",
                   ticker=ticker,
                   detail={"buy_order_id": buy_order_id, "buy_side": buy_side,
                           "sell_side": sell_side, "buy_yes_px": buy_yes_px,
                           "sell_yes_px": sell_yes_px})
-        # 起 watcher（多传两个参数：mo_upsert_trade / mo_log 回写）
+        self._mlog(f"TRADE {ticker} {action} @{buy_price:.2f} ×{count} "
+                   f"K={k_val:+.6f} |K|={abs_k:.5f} "
+                   f"→ 止盈 {sell_price:.2f} order_id={buy_order_id}")
+        # 起 watcher
         await self._spawn_momentum_watcher(
             buy_order_id, ticker, sell_side, sell_yes_px, count,
             int(cfg["subaccount"]), action, buy_price, sell_price,
             _mo_writeback=True, series=series, mo_cfg=cfg)
-        # 冷却期
-        self._mo_cooldown_until[ticker] = now + cfg["taker_interval"]
+        cooldown = max(int(cfg.get("scan_interval") or 5) * 2, 15)
+        self._mo_cooldown_until[ticker] = now + cooldown
         return True
 
     # ================= 动量机器人 UI =================
@@ -5792,7 +6072,8 @@ class DeskUI:
         try:
             self._refresh_momentum_panel_inner()
         except Exception as ex:
-            print(f"[momentum] 面板刷新失败（忽略）：{ex}")
+            self._mlog(f"PANEL 刷新失败：{ex}")
+            _mprint(f"[momentum] 面板刷新失败（忽略）：{ex}")
 
     def _refresh_momentum_panel_inner(self) -> None:
         env = self.api.env
@@ -5904,96 +6185,71 @@ class DeskUI:
             current_series = [s for s in (self.mo_cfg.get("series") or []) if s in series_opts] \
                 or [s for s in ["KXBTC15M"] if s in series_opts] or series_opts[:1]
             dlg = ui.dialog().props("persistent")
-            with dlg, ui.card().classes("w-[760px]"):
-                ui.label("动量机器人配置").classes("text-lg font-semibold")
-                with ui.grid(columns=2).classes("w-full gap-2"):
-                    self.cfg_cat = ui.select(
-                        options=all_cats if all_cats else ["Crypto"],
-                        value=current_cat, label="品类（用于筛选系列）",
-                        multiple=False).classes("w-full")
-                    self.cfg_series = ui.select(
-                        options=series_opts, value=current_series,
-                        label="监控系列（可多选）", multiple=True,
-                        with_input=True).classes("w-full")
-                    self.cfg_tif = ui.toggle(
-                        {"immediate_or_cancel": "IOC 立即吃单",
-                         "good_till_canceled": "GTC 挂单"},
-                        value=self.mo_cfg["buy_tif"]).props("dense").classes("w-full")
-                    self.cfg_strength = ui.toggle(
-                        {"弱": "弱", "中": "中", "强": "强"},
-                        value=self.mo_cfg["min_strength"]).props("dense").classes("w-full")
-                    self.cfg_frac_start = ui.number(
-                        "开始 frac（默认 2/15）", value=self.mo_cfg["frac_start"],
-                        min=0.0, max=0.99, step=0.01,
-                        format="%.3f").classes("w-full")
-                    self.cfg_frac_end = ui.number(
-                        "结束 frac（默认 14/15）", value=self.mo_cfg["frac_end"],
-                        min=0.01, max=1.0, step=0.01,
-                        format="%.3f").classes("w-full")
-                    self.cfg_qty = ui.number("每次张数", value=self.mo_cfg["qty"],
-                                             min=1).classes("w-full")
-                    self.cfg_tp = ui.number("止盈倍率", value=self.mo_cfg["tp_mult"],
-                                            min=1.01, max=3.0, step=0.05,
-                                            format="%.2f").classes("w-full")
-                    self.cfg_tp_cf = ui.switch(
-                        "参考 CF 差值动态止盈",
-                        value=bool(self.mo_cfg["tp_cf_boost"])).classes("w-full")
-                    self.cfg_tp_cf_max = ui.number(
-                        "止盈倍率上限", value=self.mo_cfg["tp_cf_max"],
-                        min=1.0, max=3.0, step=0.01,
-                        format="%.2f").classes("w-full")
-                    self.cfg_scan = ui.number("扫描间隔(秒)",
-                                              value=self.mo_cfg["scan_interval"],
-                                              min=2).classes("w-full")
-                    self.cfg_window = ui.number(
-                        "动量窗口(秒)", value=self.mo_cfg["window_sec"],
-                        min=10, max=900).classes("w-full")
-                    self.cfg_algo = ui.toggle(
-                        {"diff": "价差法", "slope": "斜率法"},
-                        value=self.mo_cfg.get("algo") or "diff") \
-                        .props("dense").classes("w-full")
-                    self.cfg_smode = ui.toggle(
-                        {"delta": "价格幅度", "volume": "成交量"},
-                        value=self.mo_cfg.get("strength_mode") or "delta") \
-                        .props("dense").classes("w-full")
-                    self.cfg_vol_mid = ui.number(
-                        "成交量·中阈值(张)", value=self.mo_cfg["vol_mid"],
-                        min=1, step=1).classes("w-full")
-                    self.cfg_vol_strong = ui.number(
-                        "成交量·强阈值(张)", value=self.mo_cfg["vol_strong"],
-                        min=2, step=1).classes("w-full")
-                    self.cfg_cool = ui.number("冷却(秒)",
-                                             value=self.mo_cfg["taker_interval"],
-                                             min=0).classes("w-full")
-                    self.cfg_max = ui.number("并行上限",
-                                             value=self.mo_cfg["max_parallel"],
-                                             min=1).classes("w-full")
-                    self.cfg_cancel = ui.number("未成交撤单(秒)",
-                                                value=self.mo_cfg["cancel_sec"],
-                                                min=3, max=600).classes("w-full")
-                    self.cfg_sub = ui.number("子账户",
-                                             value=self.mo_cfg["subaccount"],
-                                             min=0).classes("w-full")
-                    self.cfg_delta = ui.number("最小 Δ(美元)",
-                                               value=self.mo_cfg["min_delta"],
-                                               min=0, step=0.001,
-                                               format="%.3f").classes("w-full")
-                # 活跃市场 ticker（系统自动发现，只读展示）
-                with ui.row().classes("w-full items-center gap-2"):
-                    ui.label("当前活跃市场 ticker（系统自动发现，无需手填）") \
+            with dlg, ui.card().classes("w-[92vw] max-w-[720px]") \
+                    .style("max-height:88vh; overflow-y:auto"):
+                ui.label("动量机器人配置 —— 简单 Rolling K").classes("text-lg font-semibold")
+                ui.label("K = Δprice / Δtime；连续 2 个 K 同方向 + |K| ≥ 阈值 即触发吃单") \
+                    .classes("text-xs kd-mut")
+                with ui.column().classes("w-full gap-3 p-3 rounded-md") \
+                        .style("border:1px solid var(--kd-line-strong)"):
+                    ui.label("监控范围").classes("kd-section")
+                    with ui.row().classes("w-full gap-2 items-center"):
+                        self.cfg_cat = ui.select(
+                            options=all_cats if all_cats else ["Crypto"],
+                            value=current_cat, label="品类",
+                            multiple=False).classes("flex-1")
+                        self.cfg_series = ui.select(
+                            options=series_opts, value=current_series,
+                            label="监控系列（可多选）", multiple=True,
+                            with_input=True).classes("flex-1")
+                with ui.column().classes("w-full gap-3 p-3 rounded-md") \
+                        .style("border:1px solid var(--kd-line-strong)"):
+                    ui.label("动量识别").classes("kd-section")
+                    with ui.row().classes("w-full gap-2 no-wrap"):
+                        self.cfg_k_thresh = ui.number(
+                            "K 绝对值阈值",
+                            value=self.mo_cfg.get("k_threshold", 0.03),
+                            min=0.001, max=0.50, step=0.001,
+                            format="%.3f").classes("flex-1")
+                        self.cfg_scan = ui.number(
+                            "扫描间隔(秒)",
+                            value=self.mo_cfg.get("scan_interval", 5),
+                            min=2, max=60).classes("flex-1")
+                    ui.label("历史数据 p95≈0.028，默认 0.03 留安全边际；值越高触发越少但胜率越高") \
                         .classes("text-xs kd-mut")
-                    self.cfg_tick_count = ui.label("—").classes("text-xs kd-mut")
-                    ui.space()
-                    ui.button("立即刷新", icon="refresh",
-                              on_click=lambda: asyncio.create_task(
-                                  self._mo_cfg_refresh_markets())) \
-                        .props("flat dense").classes("text-xs")
-                self.cfg_tick_table = ui.table(
-                    columns=[
-                        {"name": "series", "label": "系列", "field": "series"},
-                        {"name": "ticker", "label": "市场 ticker", "field": "ticker"},
-                        {"name": "label", "label": "场次", "field": "label"},
-                    ], rows=[], row_key="ticker").classes("w-full").props("dense")
+                with ui.column().classes("w-full gap-3 p-3 rounded-md") \
+                        .style("border:1px solid var(--kd-line-strong)"):
+                    ui.label("下单与风控").classes("kd-section")
+                    with ui.row().classes("w-full gap-2 no-wrap"):
+                        self.cfg_qty = ui.number(
+                            "每次张数", value=self.mo_cfg.get("qty", 1),
+                            min=1).classes("flex-1")
+                        self.cfg_tp = ui.number(
+                            "止盈价差(元)", value=self.mo_cfg.get("tp_abs", 0.06),
+                            min=0.01, max=0.50, step=0.01,
+                            format="%.2f").classes("flex-1")
+                        self.cfg_sl = ui.number(
+                            "止损价差(元，0=禁用)", value=self.mo_cfg.get("sl_abs", 0.0),
+                            min=0.0, max=0.50, step=0.01,
+                            format="%.2f").classes("flex-1")
+                    with ui.row().classes("w-full gap-2 no-wrap"):
+                        self.cfg_tp_k = ui.number(
+                            "K 止盈加成系数",
+                            value=self.mo_cfg.get("tp_k_mult", 0.0),
+                            min=0.0, max=10.0, step=0.5,
+                            format="%.1f").classes("flex-1")
+                        self.cfg_max = ui.number(
+                            "并行上限",
+                            value=self.mo_cfg.get("max_parallel", 3),
+                            min=1).classes("flex-1")
+                        self.cfg_sub = ui.number(
+                            "子账户",
+                            value=self.mo_cfg.get("subaccount", 0),
+                            min=0).classes("flex-1")
+                    ui.label("止盈价 = 买价 + 止盈价差 + (|K|-阈值) × K加成系数（设 0 关闭加成）") \
+                        .classes("text-xs kd-mut")
+                    ui.label("买单默认 IOC 吃单，止损默认禁用（回测显示 SL=0.04 胜率40%，无SL胜率87%）；frac 区间默认 [0.13, 0.93] 覆盖 15 分钟场中间段") \
+                        .classes("text-xs kd-mut")
                 with ui.row().classes("w-full justify-end gap-2"):
                     ui.button("取消", on_click=dlg.close).props("flat")
                     ui.button("保存", icon="save",
@@ -6002,7 +6258,6 @@ class DeskUI:
             self.cfg_cat.on_value_change(lambda e: self._mo_cfg_on_cat_change(e.value))
             self._mo_cfg_dlg = dlg
         self._mo_cfg_dlg.open()
-        asyncio.create_task(self._mo_cfg_refresh_markets())
 
     def _mo_cfg_on_cat_change(self, category: str) -> None:
         """换品类 → 重新加载该品类下的系列选项。"""
@@ -6054,40 +6309,26 @@ class DeskUI:
                 self.notify("请至少选择一个监控系列", type="warning")
                 return
             new = {
-                "buy_tif": self.cfg_tif.value,
-                "min_strength": self.cfg_strength.value,
-                "qty": int(self.cfg_qty.value or 1),
-                "tp_mult": float(self.cfg_tp.value or 1.1),
-                "tp_cf_boost": bool(self.cfg_tp_cf.value),
-                "tp_cf_max": float(self.cfg_tp_cf_max.value or 1.1),
-                "frac_start": float(self.cfg_frac_start.value
-                                    if self.cfg_frac_start.value is not None else 0.1333),
-                "frac_end": float(self.cfg_frac_end.value
-                                  if self.cfg_frac_end.value is not None else 0.9333),
-                "scan_interval": int(self.cfg_scan.value or 5),
-                "window_sec": int(self.cfg_window.value or 60),
-                "algo": self.cfg_algo.value or "diff",
-                "strength_mode": self.cfg_smode.value or "delta",
-                "vol_mid": int(self.cfg_vol_mid.value or 20),
-                "vol_strong": int(self.cfg_vol_strong.value or 100),
-                "taker_interval": int(self.cfg_cool.value or 60),
-                "max_parallel": int(self.cfg_max.value or 3),
-                "cancel_sec": int(self.cfg_cancel.value or 30),
-                "subaccount": int(self.cfg_sub.value or 0),
-                "min_delta": float(self.cfg_delta.value or 0.01),
                 "category": category,
                 "series": series,
+                "scan_interval": int(self.cfg_scan.value or 5),
+                "k_threshold": float(self.cfg_k_thresh.value or 0.03),
+                "qty": int(self.cfg_qty.value or 1),
+                "tp_abs": float(self.cfg_tp.value or 0.06),
+                "tp_k_mult": float(self.cfg_tp_k.value or 0.0),
+                "sl_abs": float(self.cfg_sl.value or 0.0),
+                "max_parallel": int(self.cfg_max.value or 3),
+                "subaccount": int(self.cfg_sub.value or 0),
                 "enabled": _MO_ENGINE["running"],
-                "stop_loss": 0.0,
             }
             store.save_momentum(new)
             self.mo_cfg = store.load_config()["momentum"]
             dlg.close()
-            db.mo_log(env, "INFO", "动量配置已更新",
-                      detail={"category": category, "series": series})
+            db.mo_log(env, "INFO", "动量配置已更新（简单 Rolling K）",
+                      detail={"category": category, "series": series,
+                              "k_threshold": new["k_threshold"]})
             self.notify(
-                f"配置已保存：监控系列 {', '.join(series)}。\n"
-                f"每个系列下活跃的市场 ticker 由系统自动发现并随滚场切换。",
+                f"配置已保存：监控 {', '.join(series)}，K 阈值 {new['k_threshold']:.3f}。",
                 type="positive")
         except Exception as ex:
             self.notify(f"保存失败：{ex}", type="negative")

@@ -50,33 +50,31 @@ AI_DEFAULT = {
     }],
     "active": 0,
 }
-# 动量机器人默认配置
+# 动量机器人默认配置 —— 简单 rolling K 算法
+# K = (P_new - P_old) / (T_new - T_old)，连续 2 个 K 同方向 + |K| ≥ 阈值 即触发
 # series: 监控的系列列表（如 KXBTC15M）。每个系列下当前活跃的市场 ticker
 #         由系统自动发现（通常 2~3 个：当前场 + 下一场），永不手填。
 MO_DEFAULT = {
     "enabled": False,
     "series": ["KXBTC15M"],       # 监控系列（默认只有 BTC 15 分钟）
     "category": "Crypto",         # 仅用于过滤系列下拉的品类
-    "min_delta": 0.01,
-    "min_strength": "中",
-    "scan_interval": 5,
-    "taker_interval": 60,
-    "qty": 1,
-    "tp_mult": 1.10,
-    "buy_tif": "immediate_or_cancel",
-    "subaccount": 0,
-    "max_parallel": 3,
-    "stop_loss": 0.00,
-    "cancel_sec": 30,              # 买单/止盈单超过该秒数未成交即撤单
-    "tp_cf_boost": False,          # 是否参考 CF 指数与水位线（strike）差值动态放大止盈
-    "tp_cf_max": 1.10,             # 动态止盈倍率上限
-    "frac_start": 0.1333,          # 市场生命周期进度下限（15 分钟市场≈第 2 分钟）
-    "frac_end": 0.9333,            # 市场生命周期进度上限（15 分钟市场≈结束前 1 分钟）
-    "window_sec": 60,              # 动量检测窗口（秒）
-    "algo": "diff",                # 方向算法：diff=首尾价差法 / slope=拟合斜率法
-    "strength_mode": "delta",      # 强弱判定：delta=价格幅度 / volume=成交量
-    "vol_mid": 20,                 # 成交量判强弱：达到该张数为「中」
-    "vol_strong": 100,             # 成交量判强弱：达到该张数为「强」
+    "scan_interval": 5,           # 扫描间隔（秒）
+    "qty": 1,                     # 每次张数
+    "buy_tif": "immediate_or_cancel",  # 买单类型：IOC 吃单
+    "subaccount": 0,              # 子账户
+    "max_parallel": 3,            # 并行上限
+    "k_threshold": 0.02,          # 动量阈值 |K| ≥ 该值才触发
+                                  #   参数扫描最优值：K=0.02 + TP=0.05 → 总PnL$32.46 Calmar=73.5
+                                  #   参考基准：同方向约束 p90=0.021, p95=0.030
+    "tp_abs": 0.05,               # 止盈价差（美元）：买价 + 该值
+    "tp_k_mult": 0.0,             # 止盈动量加成：止盈价 += max(0, |K|-k_threshold) * 该系数
+                                  #   例如 tp_k_mult=2 时，K=0.05 则额外加 (0.05-0.03)*2=0.04
+                                  #   设为 0 则关闭加成，只用固定 tp_abs
+    "sl_abs": 0.0,               # 止损价差（美元）：0.0 = 禁用（默认无止损，只止盈）
+                                  #  >0 时启用，例如 0.08；默认只靠 tp_abs 吃趋势
+    "cancel_sec": 30,             # 买单超过该秒数未成交即撤单
+    "frac_start": 0.1333,         # 市场生命周期进度下限（15 分钟≈第 2 分钟）
+    "frac_end": 0.9333,           # 市场生命周期进度上限（15 分钟≈结束前 1 分钟）
 }
 
 
@@ -123,30 +121,23 @@ def _normalize_mo(mo) -> dict:
     if not d["series"]:
         d["series"] = list(MO_DEFAULT["series"])
     # 数值字段兜底
-    for key in ("min_delta", "scan_interval", "taker_interval", "qty",
-                "tp_mult", "subaccount", "max_parallel", "stop_loss",
-                "cancel_sec", "tp_cf_max", "frac_start", "frac_end",
-                "window_sec", "vol_mid", "vol_strong"):
+    for key in ("scan_interval", "qty", "subaccount", "max_parallel",
+                "k_threshold", "tp_abs", "tp_k_mult", "sl_abs",
+                "cancel_sec", "frac_start", "frac_end"):
         try:
             d[key] = float(d[key])
         except (TypeError, ValueError):
             d[key] = MO_DEFAULT[key]
     d["qty"] = max(1, int(d["qty"]))
     d["scan_interval"] = max(2, int(d["scan_interval"]))
-    d["taker_interval"] = max(0, int(d["taker_interval"]))
     d["max_parallel"] = max(1, int(d["max_parallel"]))
     d["cancel_sec"] = max(3, min(600, int(d["cancel_sec"])))
-    d["window_sec"] = max(10, min(900, int(d["window_sec"])))
-    d["vol_mid"] = max(1, int(d["vol_mid"]))
-    d["vol_strong"] = max(d["vol_mid"] + 1, int(d["vol_strong"]))
-    d["tp_mult"] = max(1.01, min(3.0, d["tp_mult"]))
-    d["tp_cf_boost"] = bool(d.get("tp_cf_boost"))
-    d["tp_cf_max"] = max(d["tp_mult"], min(3.0, d["tp_cf_max"]))
+    d["k_threshold"] = max(0.005, min(0.5, d["k_threshold"]))
+    d["tp_abs"] = max(0.01, min(0.50, d["tp_abs"]))
+    d["tp_k_mult"] = max(0.0, min(10.0, d["tp_k_mult"]))
+    d["sl_abs"] = max(0.0, min(0.50, d["sl_abs"]))
     d["frac_start"] = max(0.0, min(0.99, d["frac_start"]))
     d["frac_end"] = max(d["frac_start"], min(1.0, d["frac_end"]))
-    d["min_strength"] = str(d["min_strength"]) if d["min_strength"] in ("弱", "中", "强") else "中"
-    d["algo"] = "slope" if d.get("algo") == "slope" else "diff"
-    d["strength_mode"] = "volume" if d.get("strength_mode") == "volume" else "delta"
     d["buy_tif"] = "good_till_canceled" if d["buy_tif"] == "good_till_canceled" else "immediate_or_cancel"
     d["category"] = str(d["category"] or "")
     return d
