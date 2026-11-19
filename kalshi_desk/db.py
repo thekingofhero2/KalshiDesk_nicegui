@@ -15,6 +15,7 @@ from typing import Optional
 from uuid import uuid4
 
 import duckdb
+import pytz
 
 from .store import DATA_DIR
 
@@ -236,6 +237,32 @@ def _query(sql: str, params=None) -> list:
         cur = conn().execute(sql, params or [])
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def to_tz(ts, tz: Optional[str]):
+    """把库里存的本地 naive 时间转成目标时区；tz 为空/非法时原样返回。
+
+    库里 created_ts 由 datetime.now() 写入，是服务器本地时间（naive）。
+    用 pytz 而非 zoneinfo：Windows 默认没有 tzdata，zoneinfo 会静默失败。
+    """
+    if ts is None or not tz or not isinstance(ts, datetime):
+        return ts
+    try:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return ts.astimezone(pytz.timezone(tz))
+    except Exception:
+        return ts
+
+
+def tz_to_local_naive(dt, tz: Optional[str]):
+    """把所选时区的墙上时间换算成服务器本地 naive（库里存的时间口径）。"""
+    if dt is None or not tz or not isinstance(dt, datetime):
+        return dt
+    try:
+        return pytz.timezone(tz).localize(dt).astimezone().replace(tzinfo=None)
+    except Exception:
+        return dt
 
 
 # ================= 写入 =================
@@ -977,6 +1004,115 @@ def mo_open_by_ticker(env: str, ticker: str,
         "         OR COALESCE(updated_ts, created_ts) >= NOW() - INTERVAL 120 SECOND))) "
         f"AND created_ts >= NOW() - INTERVAL {h} MINUTE "
         "ORDER BY created_ts DESC", [env, ticker])
+
+
+def mo_analytics(env: str, days: int = 30,
+                 start: Optional[datetime] = None,
+                 end: Optional[datetime] = None,
+                 tz: str = "Asia/Shanghai") -> dict:
+    """动量机器人效果分析：汇总、系列表现、每日 pnl、累计 pnl 曲线、明细。
+
+    时间口径二选一：
+    - start/end 同时给出时用自定义时间段（naive 本地时间，闭区间）；
+    - 否则按 days 回溯，days<=0 表示全部历史。
+    tz 只影响每日分组与明细时间展示的时区，不影响汇总口径。
+    """
+    where = "env=?"
+    params: list = [env]
+    if start is not None and end is not None:
+        where += " AND created_ts >= ? AND created_ts <= ?"
+        params.extend([start, end])
+        d = -1
+    else:
+        try:
+            d = int(days or 0)
+        except (TypeError, ValueError):
+            d = 30
+        if d > 0:
+            cutoff = datetime.fromtimestamp(datetime.now().timestamp() - d * 86400)
+            where += " AND created_ts >= ?"
+            params.append(cutoff)
+
+    summary = _query(
+        "SELECT COUNT(*) AS total, "
+        "COUNT(pnl) AS closed, "
+        "COUNT(CASE WHEN pnl > 0 THEN 1 END) AS wins, "
+        "COUNT(CASE WHEN pnl < 0 THEN 1 END) AS losses, "
+        "COALESCE(SUM(pnl),0) AS pnl, "
+        "COALESCE(SUM(fees),0) AS fees, "
+        "AVG(delta) AS avg_delta, "
+        "AVG(CASE WHEN pnl IS NOT NULL THEN epoch(updated_ts) - epoch(created_ts) END) "
+        "  AS avg_hold, "
+        "COUNT(CASE WHEN state='tp_filled' THEN 1 END) AS tp_filled, "
+        "COUNT(CASE WHEN state='canceled' THEN 1 END) AS canceled, "
+        "COUNT(CASE WHEN state='failed' THEN 1 END) AS failed, "
+        "COUNT(CASE WHEN state='error' THEN 1 END) AS errors, "
+        "COUNT(CASE WHEN state IN ('buy_placed','buy_filled','tp_placed') THEN 1 END) "
+        "  AS open_now "
+        f"FROM mo_trades WHERE {where}", params)
+    s = summary[0] if summary else {}
+
+    series = _query(
+        "SELECT COALESCE(NULLIF(series,''), '—') AS series, "
+        "COUNT(*) AS total, COUNT(pnl) AS closed, "
+        "COUNT(CASE WHEN pnl > 0 THEN 1 END) AS wins, "
+        "COALESCE(SUM(pnl),0) AS pnl, AVG(delta) AS avg_delta "
+        f"FROM mo_trades WHERE {where} GROUP BY 1 ORDER BY pnl DESC", params)
+
+    # 累计曲线与每日分组都在 Python 里做，便于按所选时区切日期
+    points = _query(
+        f"SELECT created_ts, pnl FROM mo_trades WHERE {where} "
+        "ORDER BY created_ts ASC", params)
+    equity = []
+    daily_map: dict = {}
+    cum = 0.0
+    for r in points:
+        ts = r.get("created_ts")
+        pnl = r.get("pnl")
+        if pnl is not None:
+            cum += float(pnl)
+            equity.append({"ts": ts, "cum": round(cum, 4)})
+        local = to_tz(ts, tz)
+        if not isinstance(local, datetime):
+            continue
+        day = local.date()
+        cell = daily_map.setdefault(day, {"day": day, "n": 0, "pnl": 0.0})
+        cell["n"] += 1
+        if pnl is not None:
+            cell["pnl"] += float(pnl)
+    daily = [daily_map[k] for k in sorted(daily_map)]
+
+    recent = _query(
+        "SELECT buy_order_id, created_ts, ticker, series, direction, delta, "
+        "buy_px, sell_px, buy_count, state, pnl "
+        f"FROM mo_trades WHERE {where} ORDER BY created_ts DESC LIMIT 200", params)
+
+    closed = int(s.get("closed") or 0)
+    wins = int(s.get("wins") or 0)
+    total_pnl = float(s.get("pnl") or 0)
+    return {
+        "days": d,
+        "tz": tz,
+        "total": int(s.get("total") or 0),
+        "closed": closed,
+        "wins": wins,
+        "losses": int(s.get("losses") or 0),
+        "win_rate": (wins / closed) if closed else 0.0,
+        "pnl": total_pnl,
+        "fees": float(s.get("fees") or 0),
+        "avg_pnl": (total_pnl / closed) if closed else 0.0,
+        "avg_delta": float(s.get("avg_delta") or 0),
+        "avg_hold": float(s.get("avg_hold") or 0),
+        "tp_filled": int(s.get("tp_filled") or 0),
+        "canceled": int(s.get("canceled") or 0),
+        "failed": int(s.get("failed") or 0),
+        "errors": int(s.get("errors") or 0),
+        "open_now": int(s.get("open_now") or 0),
+        "series": series,
+        "daily": daily,
+        "equity": equity,
+        "recent": recent,
+    }
 
 
 def mo_stats(env: str, since_hours: float = 24.0) -> dict:

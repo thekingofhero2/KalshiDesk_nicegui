@@ -11,7 +11,7 @@ import json
 import os
 import socket
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -154,7 +154,7 @@ PAGE_ICONS = {
 PAGE_META = {
     PAGE_OVER: ("ACCOUNT", "账户概览", "余额、敞口与子账户分片，读取本地最新快照"),
     PAGE_TRADE: ("EXECUTION", "交易", "持仓、订单、成交与子账户；手动下单按分类与周期筛选"),
-    PAGE_ANALY: ("ANALYTICS", "分析", "近 30 天成交与已结算盈亏，统计自本地 DuckDB"),
+    PAGE_ANALY: ("ANALYTICS", "分析", "近 30 天成交与已结算盈亏，以及动量机器人效果分析"),
     PAGE_AI: ("INTELLIGENCE", "AI 分析", "基于本地库数据提问，模型与密钥在系统设置中配置"),
     PAGE_SET: ("CONTROL", "系统设置", "同步、连接、代理、AI 模型与用户权限"),
     PAGE_CHAT: ("COMMS", "聊天室", "同一环境下的用户共享这段讨论"),
@@ -179,6 +179,11 @@ CATEGORY_CN = {
     "Commodities": "大宗商品", "Mentions": "提及次数", "Social": "社会",
     "AI": "人工智能", "Business": "商业", "Education": "教育",
     "Exotics": "另类", "other": "其他", "Other": "其他",
+}
+TZ_OPTIONS = {
+    "Asia/Shanghai": "北京时间",
+    "UTC": "UTC",
+    "America/New_York": "美东",
 }
 
 
@@ -610,6 +615,13 @@ class DeskUI:
                      "shard_table", "sub_mini", "pos_table", "order_table",
                      "fill_table", "sub_table", "tr_table", "ai_answer",
                      "chat_box", "chat_preview", "an_metrics", "an_table",
+                     "mo_an_metrics", "mo_an_total", "mo_an_closed", "mo_an_win",
+                     "mo_an_win_sub", "mo_an_pnl", "mo_an_avg", "mo_an_delta",
+                     "mo_an_extra", "mo_an_hint", "mo_an_ts", "mo_an_range",
+                     "mo_an_tz_sel", "mo_an_custom", "mo_an_start", "mo_an_end",
+                     "mo_an_tz_hint",
+                     "mo_an_equity", "mo_an_daily", "mo_an_series_table",
+                     "mo_an_recent_table",
                      "x_bal_hint", "ws_status", "ws_stats", "ws_error", "ws_table",
                      "cf_row", "cf_src_label", "cf_ws_status",
                      "cfb_card", "cf_spread_card", "cf_spread_title",
@@ -1121,6 +1133,25 @@ class DeskUI:
 
     # ---------- 分析 ----------
     def build_analytics(self) -> None:
+        tab = getattr(self, "analytics_tab", "市场成交")
+        with ui.tabs().classes("w-full") as tabs:
+            ui.tab("市场成交", icon="query_stats").props("no-caps inline-label")
+            ui.tab("动量机器人", icon="auto_graph").props("no-caps inline-label")
+        with ui.tab_panels(tabs, value=tab).classes("w-full kd-fade") \
+                .style("background: transparent"):
+            with ui.tab_panel("市场成交"):
+                self._build_market_analytics()
+            with ui.tab_panel("动量机器人"):
+                self.build_mo_analytics()
+        tabs.on_value_change(self._on_analytics_tab)
+
+    def _on_analytics_tab(self, e) -> None:
+        """切到动量机器人 tab 时重新汇总一次，保证数据新鲜。"""
+        self.analytics_tab = e.value
+        if e.value == "动量机器人":
+            asyncio.create_task(self.load_mo_analytics())
+
+    def _build_market_analytics(self) -> None:
         with ui.row().classes("w-full items-center gap-2"):
             ui.label("统计口径 · 近 30 天").classes("kd-section")
             ui.space()
@@ -1176,6 +1207,318 @@ class DeskUI:
                 "contracts": f"{r.get('contracts') or 0:g}",
                 "volume": usd(r.get("volume")),
             } for r in (data.get("top_markets") or [])]
+            table.update()
+
+    # ---------- 分析 · 动量机器人 ----------
+    def build_mo_analytics(self) -> None:
+        days = int(getattr(self, "_mo_an_days", 30))
+        tz = getattr(self, "_mo_an_tz", "Asia/Shanghai")
+        with ui.row().classes("w-full items-center gap-2"):
+            ui.label("统计口径").classes("kd-section")
+            self.mo_an_range = ui.toggle(
+                {1: "24 小时", 7: "近 7 天", 30: "近 30 天", 0: "全部",
+                 -1: "自定义"},
+                value=days, on_change=self._on_mo_an_range) \
+                .props("dense unelevated no-caps")
+            ui.label("时区").classes("text-xs kd-mut")
+            self.mo_an_tz_sel = ui.select(
+                TZ_OPTIONS, value=tz, on_change=self._on_mo_an_tz) \
+                .props("dense outlined").classes("w-32")
+            ui.space()
+            self.mo_an_ts = ui.label("").classes("text-xs kd-mut")
+            ui.button("重新统计", icon="refresh",
+                      on_click=lambda: asyncio.create_task(self.load_mo_analytics())) \
+                .props("flat dense")
+        # 自定义时间段：常驻显示，按所选时区解释起止时间
+        self.mo_an_custom = ui.row().classes("w-full items-center gap-2")
+        with self.mo_an_custom:
+            self.mo_an_start = ui.input("开始时间").classes("w-52") \
+                .props('type="datetime-local" outlined dense')
+            self.mo_an_end = ui.input("结束时间").classes("w-52") \
+                .props('type="datetime-local" outlined dense')
+            ui.button("应用时间段", icon="filter_alt",
+                      on_click=self._apply_mo_an_custom).props("unelevated dense")
+            self.mo_an_tz_hint = ui.label(
+                f"按{TZ_OPTIONS.get(tz, tz)}输入，含首尾").classes("text-xs kd-mut")
+        self.mo_an_start.value = getattr(self, "_mo_an_start_str", "") or ""
+        self.mo_an_end.value = getattr(self, "_mo_an_end_str", "") or ""
+        self.mo_an_metrics = ui.row().classes(
+            "kd-metric-row w-full no-wrap items-stretch")
+        with self.mo_an_metrics:
+            self.mo_an_total = self._metric("动量单总数")
+            self.mo_an_closed = self._metric("已平仓")
+            self.mo_an_win, self.mo_an_win_sub = self._metric("胜率", with_sub=True)
+            self.mo_an_pnl = self._metric("累计 pnl")
+            self.mo_an_avg = self._metric("平均每单 pnl")
+            self.mo_an_delta = self._metric("平均 Δ")
+        self.mo_an_extra = ui.label("").classes("text-xs kd-mut")
+        self.mo_an_hint = ui.label("").classes("text-xs kd-mut")
+        with ui.row().classes("w-full gap-3 no-wrap items-stretch"):
+            with ui.card().classes("flex-1").props("flat"):
+                ui.label("累计盈亏曲线").classes("kd-subsection")
+                self.mo_an_equity = ui.echart({}).classes("w-full h-52")
+            with ui.card().classes("flex-1").props("flat"):
+                ui.label("每日盈亏").classes("kd-subsection")
+                self.mo_an_daily = ui.echart({}).classes("w-full h-52")
+        ui.label("各系列表现").classes("kd-section")
+        self.mo_an_series_table = ui.table(
+            columns=[
+                {"name": "series", "label": "系列", "field": "series", "align": "left"},
+                {"name": "total", "label": "单数", "field": "total", "align": "right"},
+                {"name": "closed", "label": "已平仓", "field": "closed", "align": "right"},
+                {"name": "win_rate", "label": "胜率", "field": "win_rate", "align": "right"},
+                {"name": "pnl", "label": "累计 pnl", "field": "pnl", "align": "right"},
+                {"name": "avg_delta", "label": "平均 Δ", "field": "avg_delta", "align": "right"},
+            ], rows=[], row_key="series", pagination=8,
+        ).classes("w-full")
+        ui.label("动量单明细（近 200 条）").classes("kd-section")
+        self.mo_an_recent_table = ui.table(
+            columns=[
+                {"name": "created_ts", "label": "开单时间", "field": "created_ts",
+                 "sortable": True, "align": "left"},
+                {"name": "ticker", "label": "Ticker", "field": "ticker"},
+                {"name": "series", "label": "系列", "field": "series"},
+                {"name": "direction", "label": "腿", "field": "direction"},
+                {"name": "delta", "label": "Δ", "field": "delta", "align": "right"},
+                {"name": "buy_px", "label": "买价", "field": "buy_px", "align": "right"},
+                {"name": "sell_px", "label": "止盈", "field": "sell_px", "align": "right"},
+                {"name": "buy_count", "label": "张数", "field": "buy_count", "align": "right"},
+                {"name": "state", "label": "状态", "field": "state"},
+                {"name": "pnl", "label": "pnl", "field": "pnl", "align": "right"},
+            ], rows=[], row_key="buy_order_id", pagination=15,
+        ).classes("w-full")
+        asyncio.create_task(self.load_mo_analytics())
+
+    def _on_mo_an_range(self, e) -> None:
+        v = int(e.value) if e.value is not None else 30
+        self._mo_an_days = v
+        if v == -1:
+            # 进入自定义模式：输入框为空时预填「所选时区」下最近 24 小时
+            tz = getattr(self, "_mo_an_tz", "Asia/Shanghai")
+            now_tz = db.to_tz(datetime.now(), tz)
+            now_tz = now_tz.replace(tzinfo=None) \
+                if isinstance(now_tz, datetime) else datetime.now()
+            if not (self.mo_an_start.value or "").strip():
+                self.mo_an_start.value = (now_tz - timedelta(hours=24)) \
+                    .strftime("%Y-%m-%dT%H:%M")
+            if not (self.mo_an_end.value or "").strip():
+                self.mo_an_end.value = now_tz.strftime("%Y-%m-%dT%H:%M")
+            # 预填后立即按该区间过滤，避免点了「自定义」却还显示旧口径
+            self._apply_mo_an_custom()
+            return
+        # 退出自定义模式时清掉旧区间，避免切回时误用过期数据
+        self._mo_an_start_str = ""
+        self._mo_an_end_str = ""
+        self._mo_an_start_local = None
+        self._mo_an_end_local = None
+        if el := self._el("mo_an_start"):
+            el.value = ""
+        if el := self._el("mo_an_end"):
+            el.value = ""
+        asyncio.create_task(self.load_mo_analytics())
+
+    def _on_mo_an_tz(self, e) -> None:
+        tz = e.value or "Asia/Shanghai"
+        self._mo_an_tz = tz
+        if el := self._el("mo_an_tz_hint"):
+            el.set_text(f"按{TZ_OPTIONS.get(tz, tz)}输入，含首尾")
+        # 输入框里的墙上时间不变，按新时区重新解释起止时间（过滤窗口随之平移）
+        if self._mo_an_days == -1:
+            s_val = (self._el("mo_an_start").value or "").strip() \
+                if self._el("mo_an_start") else ""
+            t_val = (self._el("mo_an_end").value or "").strip() \
+                if self._el("mo_an_end") else ""
+            try:
+                st = datetime.fromisoformat(s_val)
+                en = datetime.fromisoformat(t_val)
+                if st < en:
+                    self._mo_an_start_local = db.tz_to_local_naive(st, tz)
+                    self._mo_an_end_local = db.tz_to_local_naive(en, tz)
+                    self._mo_an_start_str = s_val
+                    self._mo_an_end_str = t_val
+            except ValueError:
+                pass
+        asyncio.create_task(self.load_mo_analytics())
+
+    def _apply_mo_an_custom(self) -> None:
+        s = (self.mo_an_start.value or "").strip()
+        t = (self.mo_an_end.value or "").strip()
+        try:
+            start = datetime.fromisoformat(s) if s else None
+            end = datetime.fromisoformat(t) if t else None
+        except ValueError:
+            self.notify("时间格式不正确，请使用 年-月-日 时:分", type="negative")
+            return
+        if start is None or end is None:
+            self.notify("请先填写开始和结束时间", type="warning")
+            return
+        if start >= end:
+            self.notify("开始时间必须早于结束时间", type="negative")
+            return
+        tz = getattr(self, "_mo_an_tz", "Asia/Shanghai")
+        # 输入的是所选时区的墙上时间，存成服务器本地时间用于查库
+        self._mo_an_start_local = self._tz_to_local_naive(start, tz)
+        self._mo_an_end_local = self._tz_to_local_naive(end, tz)
+        self._mo_an_start_str = s
+        self._mo_an_end_str = t
+        self._mo_an_days = -1
+        # 让上方口径切换到「自定义」，与实际过滤条件保持一致
+        if el := self._el("mo_an_range"):
+            if el.value != -1:
+                el.value = -1
+        asyncio.create_task(self.load_mo_analytics())
+
+    @staticmethod
+    def _tz_to_local_naive(dt: datetime, tz: str) -> datetime:
+        """把所选时区下的墙上时间换算成服务器本地 naive（库里存的口径）。"""
+        return db.tz_to_local_naive(dt, tz)
+
+    async def load_mo_analytics(self) -> None:
+        """从 DuckDB 汇总动量机器人效果，渲染指标卡 / 图表 / 表格。"""
+        if not self.api:
+            return
+        days = int(getattr(self, "_mo_an_days", 30))
+        tz = getattr(self, "_mo_an_tz", "Asia/Shanghai")
+        start = end = None
+        if days == -1:
+            sl = getattr(self, "_mo_an_start_local", None)
+            el_ = getattr(self, "_mo_an_end_local", None)
+            if isinstance(sl, datetime) and isinstance(el_, datetime):
+                start, end = sl, el_
+            else:
+                # 自定义区间没应用过时退回「全部」，避免空白页
+                days = 0
+        try:
+            data = await run.io_bound(db.mo_analytics, self.api.env,
+                                      days if days > 0 else 0,
+                                      start, end, tz)
+        except Exception as ex:
+            self.notify(f"动量统计失败：{ex}", type="negative")
+            return
+        total = int(data.get("total") or 0)
+        closed = int(data.get("closed") or 0)
+        if el := self._el("mo_an_total"):
+            el.set_text(str(total))
+        if el := self._el("mo_an_closed"):
+            el.set_text(str(closed))
+        if el := self._el("mo_an_win"):
+            el.set_text(f"{data.get('win_rate', 0) * 100:.1f}%")
+            el.props(f'color="{"positive" if data.get("win_rate", 0) >= 0.5 else "negative"}"')
+        if el := self._el("mo_an_win_sub"):
+            el.set_text(f"{data.get('wins', 0)} 胜 / {data.get('losses', 0)} 负")
+        if el := self._el("mo_an_pnl"):
+            el.set_text(usd(data.get("pnl"), signed=True))
+            el.props(f'color="{"positive" if data.get("pnl", 0) >= 0 else "negative"}"')
+        if el := self._el("mo_an_avg"):
+            el.set_text(usd(data.get("avg_pnl"), signed=True))
+        if el := self._el("mo_an_delta"):
+            el.set_text(f"{data.get('avg_delta', 0):+.3f}")
+        hold = float(data.get("avg_hold") or 0)
+        if el := self._el("mo_an_extra"):
+            el.set_text(
+                f"止盈 {data.get('tp_filled', 0)} · 撤单 {data.get('canceled', 0)} · "
+                f"失败 {data.get('failed', 0)} · 异常 {data.get('errors', 0)} · "
+                f"持仓中 {data.get('open_now', 0)} · 平均持仓 {hold:.0f}s")
+        if el := self._el("mo_an_hint"):
+            el.set_text("所选区间暂无动量单记录" if total == 0 else "")
+        tz_label = TZ_OPTIONS.get(tz, tz)
+        if el := self._el("mo_an_ts"):
+            el.set_text(f"更新于 {datetime.now():%H:%M:%S} · 时区 {tz_label}")
+
+        # === 累计盈亏曲线 ===
+        if chart := self._el("mo_an_equity"):
+            pts = []
+            for r in data.get("equity") or []:
+                ts = db.to_tz(r.get("ts"), tz)
+                if not isinstance(ts, datetime):
+                    continue
+                # 去掉时区后按服务器本地时间取毫秒值，让 X 轴展示所选时区的墙上时间
+                wall = ts.replace(tzinfo=None) if ts.tzinfo else ts
+                pts.append([int(wall.timestamp() * 1000), r.get("cum")])
+            chart.options.clear()
+            chart.options.update({
+                "grid": {"left": 62, "right": 18, "top": 12, "bottom": 26},
+                "tooltip": {"trigger": "axis"},
+                "xAxis": {"type": "time",
+                          "axisLabel": {"fontSize": 9, "color": "#888"},
+                          "axisLine": {"lineStyle": {"color": "#333"}}},
+                "yAxis": {"type": "value", "scale": True,
+                          "axisLabel": {"fontSize": 9, "color": "#888"},
+                          "splitLine": {"lineStyle": {"color": "#222"}}},
+                "series": [{
+                    "type": "line", "data": pts, "smooth": True,
+                    "showSymbol": False,
+                    "lineStyle": {"color": "#35e0a1", "width": 2},
+                    "areaStyle": {"color": "rgba(53,224,161,0.15)"},
+                }],
+            })
+            chart.update()
+
+        # === 每日盈亏 ===
+        if chart := self._el("mo_an_daily"):
+            daily = data.get("daily") or []
+            labels = [str(r.get("day"))[5:] for r in daily]
+            bars = [{
+                "value": round(float(r.get("pnl") or 0), 4),
+                "itemStyle": {"color": "#35e0a1" if (r.get("pnl") or 0) >= 0
+                              else "#f87171"},
+            } for r in daily]
+            chart.options.clear()
+            chart.options.update({
+                "grid": {"left": 62, "right": 18, "top": 12, "bottom": 26},
+                "tooltip": {"trigger": "axis"},
+                "xAxis": {"type": "category", "data": labels,
+                          "axisLabel": {"fontSize": 9, "color": "#888"},
+                          "axisLine": {"lineStyle": {"color": "#333"}}},
+                "yAxis": {"type": "value", "scale": True,
+                          "axisLabel": {"fontSize": 9, "color": "#888"},
+                          "splitLine": {"lineStyle": {"color": "#222"}}},
+                "series": [{"type": "bar", "data": bars, "barMaxWidth": 22}],
+            })
+            chart.update()
+
+        # === 系列表现 ===
+        if table := self._el("mo_an_series_table"):
+            rows = []
+            for r in data.get("series") or []:
+                c = int(r.get("closed") or 0)
+                wr = (int(r.get("wins") or 0) / c * 100) if c else 0.0
+                rows.append({
+                    "series": r.get("series") or "—",
+                    "total": str(r.get("total") or 0),
+                    "closed": str(c),
+                    "win_rate": f"{wr:.1f}%",
+                    "pnl": usd(r.get("pnl"), signed=True),
+                    "avg_delta": f"{float(r.get('avg_delta') or 0):+.3f}",
+                })
+            table.rows = rows
+            table.update()
+
+        # === 明细 ===
+        if table := self._el("mo_an_recent_table"):
+            cols = [dict(c) for c in table.columns]
+            for c in cols:
+                if c.get("name") == "created_ts":
+                    c["label"] = f"开单时间（{tz_label}）"
+            table.columns = cols
+            rows = []
+            for r in data.get("recent") or []:
+                local = db.to_tz(r.get("created_ts"), tz)
+                rows.append({
+                    "buy_order_id": r.get("buy_order_id"),
+                    "created_ts": local.strftime("%m-%d %H:%M:%S")
+                    if isinstance(local, datetime) else "—",
+                    "ticker": r.get("ticker") or "",
+                    "series": r.get("series") or "—",
+                    "direction": (r.get("direction") or "").upper(),
+                    "delta": f"{float(r.get('delta') or 0):+.4f}",
+                    "buy_px": f"{float(r.get('buy_px') or 0):.2f}" if r.get("buy_px") is not None else "—",
+                    "sell_px": f"{float(r.get('sell_px') or 0):.2f}" if r.get("sell_px") is not None else "—",
+                    "buy_count": str(r.get("buy_count") or 0),
+                    "state": r.get("state") or "",
+                    "pnl": usd(r.get("pnl"), signed=True) if r.get("pnl") is not None else "—",
+                })
+            table.rows = rows
             table.update()
 
     # ---------- AI ----------
@@ -3685,18 +4028,22 @@ class DeskUI:
             self.est_label.set_text("")
 
     # ---------- 动量面板（独立入口，方向/价格全自动） ----------
-    async def _detect_momentum(self, ticker: str,
-                                window_sec: int = 60) -> tuple[str, float]:
-        """检测哪条腿在上涨，返回 (direction, delta)，direction ∈ {"yes","no"}。
+    async def _detect_momentum(self, ticker: str, window_sec: int = 60,
+                               algo: str = "diff") -> tuple[str, float, float]:
+        """检测哪条腿在上涨，返回 (direction, delta, vol)。
 
         Kalshi 二元市场 YES 价 + NO 价 = 1，所以 YES 价上涨 ⇔ NO 价下跌：
           delta > 0 → YES 腿在涨 → buy_yes
           delta < 0 → NO 腿在涨  → buy_no
-        用窗口内前 20% / 后 20% 成交价的均值差抗噪（首尾单笔容易被插针带偏）。
+
+        algo:
+          diff  —— 窗口内前 20% / 后 20% 成交价均值差（抗单笔插针）
+          slope —— 全部成交点做最小二乘拟合，斜率 × 时间跨度（同样归一到价格变化）
+        vol: 窗口内成交张数合计，用于「按成交量判强弱」。
         """
-        direction, delta = "yes", 0.0
+        direction, delta, vol = "yes", 0.0, 0.0
         if not (self.api and ticker):
-            return direction, delta
+            return direction, delta, vol
 
         def _fetch(win: int) -> list:
             try:
@@ -3705,22 +4052,66 @@ class DeskUI:
             except Exception:
                 return []
 
-        # 15 分钟类市场成交稀少：60s 窗口不足 2 笔时自动扩到 300s / 900s
+        # 15 分钟类市场成交稀少：窗口不足 2 笔时自动扩到 300s / 900s
         rows: list = []
         for win in (window_sec, max(window_sec, 300), max(window_sec, 900)):
             rows = await run.io_bound(_fetch, win)
             if len(rows) >= 2:
                 break
         if len(rows) < 2:  # 仍不足 → 本轮不触发
-            return direction, delta
+            return direction, delta, vol
         pts = [float(r["price"]) for r in rows if r.get("price") is not None]
         if len(pts) < 2:
-            return direction, delta
-        k = max(1, int(len(pts) * 0.2))
-        head = sum(pts[:k]) / k
-        tail = sum(pts[-k:]) / k
-        delta = tail - head
-        return ("yes" if delta >= 0 else "no"), delta
+            return direction, delta, vol
+        for r in rows:
+            try:
+                vol += float(r.get("count") or 0)
+            except (TypeError, ValueError):
+                pass
+        if algo == "slope":
+            delta = self._slope_delta(rows, pts, window_sec)
+        else:
+            k = max(1, int(len(pts) * 0.2))
+            head = sum(pts[:k]) / k
+            tail = sum(pts[-k:]) / k
+            delta = tail - head
+        return ("yes" if delta >= 0 else "no"), delta, vol
+
+    @staticmethod
+    def _slope_delta(rows: list, pts: list, window_sec: int) -> float:
+        """最小二乘斜率 × 时间跨度 → 与价差法同量纲（窗口内价格变化）。"""
+        ts: list = []
+        for i, r in enumerate([r for r in rows if r.get("price") is not None]):
+            try:
+                ts.append(float(r.get("ts") or 0))
+            except (TypeError, ValueError):
+                ts.append(float(i))
+        if len(ts) != len(pts):
+            return 0.0
+        t0 = ts[0]
+        xs = [t - t0 for t in ts]
+        n = len(xs)
+        sx = sum(xs)
+        sy = sum(pts)
+        sxx = sum(x * x for x in xs)
+        sxy = sum(x * y for x, y in zip(xs, pts))
+        den = n * sxx - sx * sx
+        if not den:
+            return 0.0
+        slope = (n * sxy - sx * sy) / den
+        span = xs[-1] if xs[-1] > 0 else float(window_sec)
+        return slope * span
+
+    @staticmethod
+    def _mo_strength(delta: float, vol: float, mode: str,
+                     vol_mid: float = 20, vol_strong: float = 100) -> str:
+        """强弱判定：delta=按价格幅度 / volume=按窗口内成交量（张）。"""
+        if mode == "volume":
+            if vol >= vol_strong:
+                return "强"
+            return "中" if vol >= vol_mid else "弱"
+        a = abs(delta)
+        return "强" if a >= 0.03 else ("中" if a >= 0.01 else "弱")
 
     @staticmethod
     def _momentum_buy_px(quote: dict, direction: str) -> Optional[float]:
@@ -3856,7 +4247,9 @@ class DeskUI:
             self._mo_dir, self._mo_delta = "yes", 0.0
             self._paint_momentum("yes", 0.0, None)
             return
-        direction, delta = await self._detect_momentum(ticker)
+        direction, delta, _ = await self._detect_momentum(
+            ticker, int((self.mo_cfg or {}).get("window_sec") or 60),
+            (self.mo_cfg or {}).get("algo") or "diff")
         self._mo_dir, self._mo_delta = direction, delta
         self._paint_momentum(direction, delta, self._quote)
 
@@ -3872,7 +4265,9 @@ class DeskUI:
             return
         self._set_quote(quote)
         if getattr(self, "_trade_momentum", False):
-            direction, delta = await self._detect_momentum(ticker)
+            direction, delta, _ = await self._detect_momentum(
+                ticker, int((self.mo_cfg or {}).get("window_sec") or 60),
+                (self.mo_cfg or {}).get("algo") or "diff")
             self._mo_dir, self._mo_delta = direction, delta
             self._paint_momentum(direction, delta, quote)
         else:
@@ -3993,7 +4388,9 @@ class DeskUI:
         buy_tif = self.tif_toggle.value or "immediate_or_cancel"
         sub = int(self.sub_input.value or 0)
         # === 1) 下单瞬间重新检测动量方向 ===
-        direction, delta = await self._detect_momentum(ticker)
+        direction, delta, _ = await self._detect_momentum(
+            ticker, int((self.mo_cfg or {}).get("window_sec") or 60),
+            (self.mo_cfg or {}).get("algo") or "diff")
         action = "buy_yes" if direction == "yes" else "buy_no"
         # === 2) 下单瞬间拉最新盘口 → 最新可成交买价 ===
         try:
@@ -4279,8 +4676,11 @@ class DeskUI:
         ticker = ctx["ticker"]
         env = self.api.env if self.api else "demo"
         direction = ctx.get("direction") or "yes"
+        _cfg = ctx.get("mo_cfg") or self.mo_cfg or store.MO_DEFAULT
         try:
-            new_dir, delta = await self._detect_momentum(ticker)
+            new_dir, delta, _ = await self._detect_momentum(
+                ticker, int(_cfg.get("window_sec") or 60),
+                _cfg.get("algo") or "diff")
         except Exception:
             return False
         if new_dir != direction or abs(delta) < 0.01:
@@ -5237,14 +5637,26 @@ class DeskUI:
         if frac is not None and not (cfg["frac_start"] <= frac <= cfg["frac_end"]):
             return False
         # 动量检测
-        direction, delta = await self._detect_momentum(
-            ticker, int(cfg.get("window_sec") or 60))
+        direction, delta, vol = await self._detect_momentum(
+            ticker, int(cfg.get("window_sec") or 60),
+            cfg.get("algo") or "diff")
         abs_delta = abs(delta)
-        strength = "强" if abs_delta >= 0.03 else ("中" if abs_delta >= 0.01 else "弱")
+        smode = cfg.get("strength_mode") or "delta"
+        strength = self._mo_strength(
+            delta, vol, smode,
+            float(cfg.get("vol_mid") or 20), float(cfg.get("vol_strong") or 100))
         threshold_map = {"弱": 0.00, "中": 0.01, "强": 0.03}
-        need_min_delta = threshold_map.get(cfg["min_strength"], 0.01)
-        if abs_delta < max(cfg["min_delta"], need_min_delta):
-            return False
+        if smode == "volume":
+            # 按成交量判强弱：等级达标 + 价格变化不低于最小 Δ 底线
+            rank = {"弱": 0, "中": 1, "强": 2}
+            if rank.get(strength, 0) < rank.get(cfg["min_strength"], 1):
+                return False
+            if abs_delta < cfg["min_delta"]:
+                return False
+        else:
+            need_min_delta = threshold_map.get(cfg["min_strength"], 0.01)
+            if abs_delta < max(cfg["min_delta"], need_min_delta):
+                return False
         buy_price = self._momentum_buy_px(live or {}, direction)
         if buy_price is None:
             return False
@@ -5282,7 +5694,7 @@ class DeskUI:
                            state="buy_placed")
         db.mo_log(env, "TRADE",
                   f"买入 {ACTION_LABEL[action]} {ticker} @{buy_price:.2f} "
-                  f"×{count}，Δ{delta:+.3f}（动量{strength}）→ 止盈 "
+                  f"×{count}，Δ{delta:+.3f} 量{vol:.0f}（动量{strength}）→ 止盈 "
                   f"{sell_price:.2f}（×{tp_mult:.3f}）",
                   ticker=ticker,
                   detail={"buy_order_id": buy_order_id, "buy_side": buy_side,
@@ -5536,6 +5948,20 @@ class DeskUI:
                     self.cfg_window = ui.number(
                         "动量窗口(秒)", value=self.mo_cfg["window_sec"],
                         min=10, max=900).classes("w-full")
+                    self.cfg_algo = ui.toggle(
+                        {"diff": "价差法", "slope": "斜率法"},
+                        value=self.mo_cfg.get("algo") or "diff") \
+                        .props("dense").classes("w-full")
+                    self.cfg_smode = ui.toggle(
+                        {"delta": "价格幅度", "volume": "成交量"},
+                        value=self.mo_cfg.get("strength_mode") or "delta") \
+                        .props("dense").classes("w-full")
+                    self.cfg_vol_mid = ui.number(
+                        "成交量·中阈值(张)", value=self.mo_cfg["vol_mid"],
+                        min=1, step=1).classes("w-full")
+                    self.cfg_vol_strong = ui.number(
+                        "成交量·强阈值(张)", value=self.mo_cfg["vol_strong"],
+                        min=2, step=1).classes("w-full")
                     self.cfg_cool = ui.number("冷却(秒)",
                                              value=self.mo_cfg["taker_interval"],
                                              min=0).classes("w-full")
@@ -5640,6 +6066,10 @@ class DeskUI:
                                   if self.cfg_frac_end.value is not None else 0.9333),
                 "scan_interval": int(self.cfg_scan.value or 5),
                 "window_sec": int(self.cfg_window.value or 60),
+                "algo": self.cfg_algo.value or "diff",
+                "strength_mode": self.cfg_smode.value or "delta",
+                "vol_mid": int(self.cfg_vol_mid.value or 20),
+                "vol_strong": int(self.cfg_vol_strong.value or 100),
                 "taker_interval": int(self.cfg_cool.value or 60),
                 "max_parallel": int(self.cfg_max.value or 3),
                 "cancel_sec": int(self.cfg_cancel.value or 30),

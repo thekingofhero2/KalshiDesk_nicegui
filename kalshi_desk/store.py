@@ -73,6 +73,10 @@ MO_DEFAULT = {
     "frac_start": 0.1333,          # 市场生命周期进度下限（15 分钟市场≈第 2 分钟）
     "frac_end": 0.9333,            # 市场生命周期进度上限（15 分钟市场≈结束前 1 分钟）
     "window_sec": 60,              # 动量检测窗口（秒）
+    "algo": "diff",                # 方向算法：diff=首尾价差法 / slope=拟合斜率法
+    "strength_mode": "delta",      # 强弱判定：delta=价格幅度 / volume=成交量
+    "vol_mid": 20,                 # 成交量判强弱：达到该张数为「中」
+    "vol_strong": 100,             # 成交量判强弱：达到该张数为「强」
 }
 
 
@@ -122,7 +126,7 @@ def _normalize_mo(mo) -> dict:
     for key in ("min_delta", "scan_interval", "taker_interval", "qty",
                 "tp_mult", "subaccount", "max_parallel", "stop_loss",
                 "cancel_sec", "tp_cf_max", "frac_start", "frac_end",
-                "window_sec"):
+                "window_sec", "vol_mid", "vol_strong"):
         try:
             d[key] = float(d[key])
         except (TypeError, ValueError):
@@ -133,12 +137,16 @@ def _normalize_mo(mo) -> dict:
     d["max_parallel"] = max(1, int(d["max_parallel"]))
     d["cancel_sec"] = max(3, min(600, int(d["cancel_sec"])))
     d["window_sec"] = max(10, min(900, int(d["window_sec"])))
+    d["vol_mid"] = max(1, int(d["vol_mid"]))
+    d["vol_strong"] = max(d["vol_mid"] + 1, int(d["vol_strong"]))
     d["tp_mult"] = max(1.01, min(3.0, d["tp_mult"]))
     d["tp_cf_boost"] = bool(d.get("tp_cf_boost"))
     d["tp_cf_max"] = max(d["tp_mult"], min(3.0, d["tp_cf_max"]))
     d["frac_start"] = max(0.0, min(0.99, d["frac_start"]))
     d["frac_end"] = max(d["frac_start"], min(1.0, d["frac_end"]))
     d["min_strength"] = str(d["min_strength"]) if d["min_strength"] in ("弱", "中", "强") else "中"
+    d["algo"] = "slope" if d.get("algo") == "slope" else "diff"
+    d["strength_mode"] = "volume" if d.get("strength_mode") == "volume" else "delta"
     d["buy_tif"] = "good_till_canceled" if d["buy_tif"] == "good_till_canceled" else "immediate_or_cancel"
     d["category"] = str(d["category"] or "")
     return d
