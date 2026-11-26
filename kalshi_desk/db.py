@@ -521,6 +521,48 @@ def market_trades_count(env: str) -> int:
     return int(rows[0]["n"]) if rows else 0
 
 
+def market_tickers_recent(env: str, limit: int = 300) -> list:
+    """有实时成交落库的 ticker（按最新成交时间倒序），分析页选择用。"""
+    return _query(
+        "SELECT ticker, MAX(ts) AS last_ts, COUNT(*) AS n FROM market_trades "
+        "WHERE env=? GROUP BY ticker ORDER BY last_ts DESC LIMIT ?",
+        [env, int(limit)])
+
+
+def ticker_volume_stats(env: str, ticker: str) -> dict:
+    """单 ticker 的成交量分布（成交量 = price × count，单位美元）。
+
+    返回 prices（按价格档聚合）、seconds（按秒聚合）与 summary 汇总。
+    market_trades.ts 为秒级时间戳，可直接按 ts 聚合。
+    """
+    prices = _query(
+        "SELECT ROUND(price, 2) AS price, SUM(price * count) AS volume, "
+        "SUM(count) AS count, COUNT(*) AS trades FROM market_trades "
+        "WHERE env=? AND ticker=? AND price IS NOT NULL "
+        "GROUP BY 1 ORDER BY 1", [env, ticker])
+    seconds = _query(
+        "SELECT ts AS sec, SUM(price * count) AS volume, "
+        "SUM(count) AS count, COUNT(*) AS trades FROM market_trades "
+        "WHERE env=? AND ticker=? AND price IS NOT NULL "
+        "GROUP BY 1 ORDER BY 1", [env, ticker])
+    total_vol = sum(float(r.get("volume") or 0) for r in prices)
+    total_cnt = sum(float(r.get("count") or 0) for r in prices)
+    return {
+        "ticker": ticker,
+        "prices": prices,
+        "seconds": seconds,
+        "summary": {
+            "trades": sum(int(r.get("trades") or 0) for r in prices),
+            "volume": total_vol,
+            "count": total_cnt,
+            "price_levels": len(prices),
+            "seconds": len(seconds),
+            "first_ts": seconds[0]["sec"] if seconds else None,
+            "last_ts": seconds[-1]["sec"] if seconds else None,
+        },
+    }
+
+
 # ================= Perps（Kalshi Invest）实时成交 =================
 def save_perps_trades(env: str, rows: list) -> None:
     """批量写入 perps 实时成交（按 trade_id 去重）。"""
@@ -682,6 +724,22 @@ def cfb_history(env: str, index_id: str, hours: float = 24.0,
         "ORDER BY ingested_at DESC LIMIT ?",
         [env, index_id, cutoff, int(limit)])
     rows.reverse()          # 取最近 limit 条，再转成时间正序
+    return rows
+
+
+def cfb_ticks_range(env: str, index_id: str, since_ms: int,
+                    limit: int = 60000) -> list[dict]:
+    """某 CF index 在 since_ms 之后的原始 tick，按 time_ms 正序返回。
+
+    15 分钟 K 线聚合用：比 cfb_history 多，按毫秒时间精确取区间；
+    超限时保留最新的 limit 条（倒序取再反转），避免截掉当前段。
+    """
+    rows = _query(
+        "SELECT value, time_ms FROM cfb_ticks "
+        "WHERE env=? AND index_id=? AND time_ms >= ? "
+        "ORDER BY time_ms DESC LIMIT ?",
+        [env, index_id, int(since_ms), int(limit)])
+    rows.reverse()
     return rows
 
 

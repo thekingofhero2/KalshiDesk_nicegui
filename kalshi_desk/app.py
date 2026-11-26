@@ -155,7 +155,8 @@ PAGE_ICONS = {
 PAGE_META = {
     PAGE_OVER: ("ACCOUNT", "账户概览", "余额、敞口与子账户分片，读取本地最新快照"),
     PAGE_TRADE: ("EXECUTION", "交易", "持仓、订单、成交与子账户；手动下单按分类与周期筛选"),
-    PAGE_ANALY: ("ANALYTICS", "分析", "近 30 天成交与已结算盈亏，以及动量机器人效果分析"),
+    PAGE_ANALY: ("ANALYTICS", "分析", "近 30 天成交与已结算盈亏、动量机器人效果分析，"
+                                   "以及单 ticker 成交量价格档 / 每秒分布"),
     PAGE_AI: ("INTELLIGENCE", "AI 分析", "基于本地库数据提问，模型与密钥在系统设置中配置"),
     PAGE_SET: ("CONTROL", "系统设置", "同步、连接、代理、AI 模型与用户权限"),
     PAGE_CHAT: ("COMMS", "聊天室", "同一环境下的用户共享这段讨论"),
@@ -300,7 +301,14 @@ class DeskUI:
         self._trade_chart_busy = False
         self._trade_chart_ticker = ""
         self._trade_chart_timer = None
+        self._quote: Optional[dict] = None   # 下单框当前 ticker 的行情快照
         self._cf_quote_timer = None   # 下单框 CF 面板实时刷新计时器
+        # 下单框 BRTI 15 分钟 K 线（与 KXBTC15M 结算窗口对齐）
+        self._brti_timer = None
+        self._brti_busy = False
+        self._brti_candles: list = []   # 已聚合好的 15 分钟 OHLC（来自 DuckDB）
+        self._brti_last_fetch = 0.0     # 上次从库里取 tick 的时间戳
+        self._brti_bucket: Optional[int] = None  # 上次聚合覆盖到的 15 分钟桶起点(ms)
         self._catalog = []           # 市场目录（series）内存缓存，跨多次下单复用
         self._catalog_env: Optional[str] = None   # 上面这份缓存属于哪个环境
         # CF Benchmarks 刷新状态
@@ -633,6 +641,9 @@ class DeskUI:
                      "mo_an_tz_hint",
                      "mo_an_equity", "mo_an_daily", "mo_an_series_table",
                      "mo_an_recent_table",
+                     "an_ticker_select", "an_vol_info", "an_vol_price_chart",
+                     "an_vol_sec_chart", "an_v_trades", "an_v_vol", "an_v_cnt",
+                     "an_v_avg", "an_v_peak",
                      "x_bal_hint", "ws_status", "ws_stats", "ws_error", "ws_table",
                      "cf_row", "cf_src_label", "cf_ws_status",
                      "cfb_card", "cf_spread_card", "cf_spread_title",
@@ -1163,6 +1174,7 @@ class DeskUI:
             asyncio.create_task(self.load_mo_analytics())
 
     def _build_market_analytics(self) -> None:
+        self._an_vol_busy = False
         with ui.row().classes("w-full items-center gap-2"):
             ui.label("统计口径 · 近 30 天").classes("kd-section")
             ui.space()
@@ -1187,7 +1199,36 @@ class DeskUI:
             ],
             rows=[], row_key="ticker", pagination=10,
         ).classes("w-full")
+        ui.label("单 ticker 成交量分布（成交量 = 价格 × 张数）").classes("kd-section")
+        with ui.row().classes("w-full gap-3 items-end no-wrap"):
+            self.an_ticker_select = ui.select({}, label="ticker", with_input=True) \
+                .classes("flex-1").props("dense outlined")
+            self._api_btn("刷新分布", icon="refresh",
+                          coro=self.load_ticker_volume).props("flat dense")
+        self.an_vol_info = ui.label("选择 ticker 后统计本地库实时成交") \
+            .classes("text-xs kd-mut")
+        with ui.row().classes("kd-metric-row w-full no-wrap items-stretch"):
+            self.an_v_trades = self._metric("成交笔数")
+            self.an_v_vol = self._metric("总成交量")
+            self.an_v_cnt = self._metric("总张数")
+            self.an_v_avg = self._metric("单秒均量")
+            self.an_v_peak = self._metric("峰值秒量")
+        with ui.row().classes("w-full gap-3 items-start no-wrap"):
+            with ui.card().classes("flex-1 min-w-0 gap-1 p-2 rounded-lg") \
+                    .props("flat dense"):
+                ui.label("成交量分布 · 按价格档").classes("text-xs kd-mut")
+                self.an_vol_price_chart = ui.echart(
+                    self._vol_price_options([], 0.0)).classes("w-full h-64")
+            with ui.card().classes("flex-1 min-w-0 gap-1 p-2 rounded-lg") \
+                    .props("flat dense"):
+                ui.label("每秒成交量分布").classes("text-xs kd-mut")
+                self.an_vol_sec_chart = ui.echart(
+                    self._vol_second_options([])).classes("w-full h-64")
+        self.an_ticker_select.on_value_change(
+            lambda _: asyncio.create_task(self.load_ticker_volume()))
+        ui.timer(10.0, self.load_ticker_volume)
         asyncio.create_task(self.load_analytics())
+        asyncio.create_task(self._init_ticker_volume())
 
     async def load_analytics(self) -> None:
         if not self.api:
@@ -1531,6 +1572,133 @@ class DeskUI:
                 })
             table.rows = rows
             table.update()
+
+    @staticmethod
+    def _vol_price_options(prices: list, total: float) -> dict:
+        """成交量按价格档分布：柱状为成交量，折线为累计占比。"""
+        labels = [f"{round(float(r.get('price') or 0) * 100)}¢" for r in prices]
+        volume = [round(float(r.get("volume") or 0), 4) for r in prices]
+        cum, acc = [], 0.0
+        for v in volume:
+            acc += v
+            cum.append(round(acc / total * 100, 2) if total else 0.0)
+        return {
+            "animationDurationUpdate": 250,
+            "grid": {"left": 56, "right": 46, "top": 30, "bottom": 28},
+            "tooltip": {"trigger": "axis"},
+            "legend": {"top": 0, "textStyle": {"color": "#888", "fontSize": 10}},
+            "xAxis": {"type": "category", "data": labels,
+                      "axisLabel": {"fontSize": 9, "color": "#888"},
+                      "axisLine": {"lineStyle": {"color": "#333"}}},
+            "yAxis": [
+                {"type": "value", "name": "成交量 $",
+                 "axisLabel": {"fontSize": 9, "color": "#888"},
+                 "splitLine": {"lineStyle": {"color": "#222"}}},
+                {"type": "value", "name": "累计 %", "min": 0, "max": 100,
+                 "axisLabel": {"fontSize": 9, "color": "#888"},
+                 "splitLine": {"show": False}},
+            ],
+            "series": [
+                {"name": "成交量", "type": "bar", "data": volume,
+                 "itemStyle": {"color": "rgba(53,224,161,.55)"}},
+                {"name": "累计占比", "type": "line", "yAxisIndex": 1, "data": cum,
+                 "showSymbol": False,
+                 "lineStyle": {"color": "#e0b341", "width": 1.4},
+                 "itemStyle": {"color": "#e0b341"}},
+            ],
+        }
+
+    @staticmethod
+    def _vol_second_options(seconds: list) -> dict:
+        """同一 ticker 每秒成交量（价格 × 张数）柱状时序。"""
+        data = [[int(r.get("sec") or 0) * 1000, round(float(r.get("volume") or 0), 4)]
+                for r in seconds]
+        return {
+            "animationDurationUpdate": 250,
+            "grid": {"left": 56, "right": 20, "top": 26, "bottom": 40},
+            "tooltip": {"trigger": "axis"},
+            "xAxis": {"type": "time",
+                      "axisLabel": {"fontSize": 9, "color": "#888"},
+                      "axisLine": {"lineStyle": {"color": "#333"}}},
+            "yAxis": {"type": "value", "name": "成交量 $",
+                      "axisLabel": {"fontSize": 9, "color": "#888"},
+                      "splitLine": {"lineStyle": {"color": "#222"}}},
+            "dataZoom": [{"type": "inside"},
+                         {"type": "slider", "height": 12, "bottom": 6,
+                          "borderColor": "#222",
+                          "fillerColor": "rgba(53,224,161,.12)"}],
+            "series": [{"name": "每秒成交量", "type": "bar", "data": data,
+                        "itemStyle": {"color": "rgba(53,224,161,.5)"}}],
+        }
+
+    async def _init_ticker_volume(self) -> None:
+        if not (self.api and self._el("an_ticker_select")):
+            return
+        try:
+            rows = await run.io_bound(db.market_tickers_recent, self.api.env, 300)
+        except Exception as ex:
+            self.notify(f"ticker 列表加载失败：{ex}", type="negative")
+            return
+        select = self._el("an_ticker_select")
+        if not select:
+            return
+        options = {r["ticker"]: f"{r['ticker']} · {int(r.get('n') or 0)} 笔"
+                   for r in rows}
+        select.options = options
+        select.value = (select.value if select.value in options else
+                        (rows[0]["ticker"] if rows else None))
+        select.update()
+        await self.load_ticker_volume()
+
+    async def load_ticker_volume(self) -> None:
+        """统计当前 ticker 的成交量：按价格档 + 按秒两张分布图。"""
+        select = self._el("an_ticker_select")
+        if not (self.api and select and select.value):
+            return
+        if getattr(self, "_an_vol_busy", False):
+            return
+        ticker = select.value
+        self._an_vol_busy = True
+        try:
+            data = await run.io_bound(db.ticker_volume_stats, self.api.env, ticker)
+        except Exception as ex:
+            if el := self._el("an_vol_info"):
+                el.set_text(f"{ticker} 统计失败：{str(ex)[:120]}")
+            return
+        finally:
+            self._an_vol_busy = False
+        cur = self._el("an_ticker_select")
+        if not cur or cur.value != ticker:
+            return
+        s = data["summary"]
+        secs = data["seconds"]
+        avg = (s["volume"] / s["seconds"]) if s["seconds"] else 0.0
+        peak = max((float(r.get("volume") or 0) for r in secs), default=0.0)
+        if el := self._el("an_v_trades"):
+            el.set_text(f"{s['trades']:,}")
+        if el := self._el("an_v_vol"):
+            el.set_text(usd(s["volume"]))
+        if el := self._el("an_v_cnt"):
+            el.set_text(f"{s['count']:,.0f}")
+        if el := self._el("an_v_avg"):
+            el.set_text(usd(avg))
+        if el := self._el("an_v_peak"):
+            el.set_text(usd(peak))
+        if el := self._el("an_vol_info"):
+            if s["trades"]:
+                el.set_text(f"{ticker} · {s['price_levels']} 个价格档 · "
+                            f"{s['seconds']} 个有成交秒 · "
+                            f"{fmt_ts(s['first_ts'])} → {fmt_ts(s['last_ts'])}")
+            else:
+                el.set_text(f"{ticker} 暂无实时成交数据")
+        if chart := self._el("an_vol_price_chart"):
+            chart.options.clear()
+            chart.options.update(self._vol_price_options(data["prices"], s["volume"]))
+            chart.update()
+        if chart := self._el("an_vol_sec_chart"):
+            chart.options.clear()
+            chart.options.update(self._vol_second_options(secs))
+            chart.update()
 
     # ---------- AI ----------
     def build_ai_page(self) -> None:
@@ -3202,6 +3370,20 @@ class DeskUI:
                         [], self._ts_epoch((quote or {}).get("open_time")),
                         self._ts_epoch((quote or {}).get("close_time")))) \
                         .classes("w-full h-52")
+                # BRTI 15 分钟 K 线：只在 BTC 类市场显示，桶边界与 KXBTC15M 结算一致
+                self.brti_card = ui.card().classes("w-full gap-1 p-2 rounded-lg") \
+                    .props("flat dense")
+                self.brti_card.visible = False
+                with self.brti_card:
+                    with ui.row().classes("w-full items-center gap-2"):
+                        ui.label("BRTI 15 分钟 K 线").classes("kd-section")
+                        ui.label("桶边界 :00 / :15 / :30 / :45（与 BTC 15M 结算对齐）") \
+                            .classes("text-xs kd-mut")
+                        ui.space()
+                        self.brti_info = ui.label("等待数据…") \
+                            .classes("text-xs font-mono kd-mut")
+                    self.brti_chart = ui.echart(self._brti_chart_options([])) \
+                        .classes("w-full h-52")
                 # CF Benchmarks 面板（选中 CF 类市场时动态渲染水位 + 曲线 + 差值）
                 self.cfb_card = ui.card().classes("w-full gap-1 p-2 rounded-lg").props("flat dense")
                 self.cfb_card.visible = False
@@ -3313,15 +3495,21 @@ class DeskUI:
                 self._on_action_change(default_action)
                 self._update_est()
             self._trade_chart_ticker = ticker or ""
+            # BRTI K 线缓存只对本次对话框有效，重新打开时重新聚合
+            self._brti_candles = []
+            self._brti_last_fetch = 0.0
+            self._brti_bucket = None
             # open_trade 由后台任务执行，await 后没有默认 slot；计时器必须显式挂到对话框。
             with self.trade_dlg:
                 self._trade_chart_timer = ui.timer(2.0, self.refresh_trade_chart)
                 self._cf_quote_timer = ui.timer(2.0, self.refresh_cf_quote_panel)
+                self._brti_timer = ui.timer(2.0, self._refresh_brti_kline)
                 if momentum:
                     self._mo_timer = ui.timer(2.0, self._refresh_momentum_panel)
             self.trade_dlg.open()
             if ticker:
                 asyncio.create_task(self._activate_trade_chart(ticker))
+                asyncio.create_task(self._refresh_brti_kline())
             if momentum:
                 if ticker:
                     asyncio.create_task(self._refresh_momentum_panel())
@@ -3416,6 +3604,7 @@ class DeskUI:
                 chart.options.clear()
                 chart.options.update(self._trade_chart_options([]))
                 chart.update()
+            self._brti_hide()
             if info := self._el("trade_chart_info"):
                 info.set_text("选择 ticker 后按所属市场自动订阅并绘图")
 
@@ -3425,6 +3614,9 @@ class DeskUI:
             if self._cf_quote_timer is not None:
                 self._cf_quote_timer.active = False
                 self._cf_quote_timer = None
+            if self._brti_timer is not None:
+                self._brti_timer.active = False
+                self._brti_timer = None
             if getattr(self, "_mo_timer", None) is not None:
                 self._mo_timer.active = False
                 self._mo_timer = None
@@ -3433,6 +3625,9 @@ class DeskUI:
         if self._trade_chart_timer is not None:
             self._trade_chart_timer.active = False
             self._trade_chart_timer = None
+        if self._brti_timer is not None:
+            self._brti_timer.active = False
+            self._brti_timer = None
         self._trade_chart_ticker = ""
 
     async def _activate_trade_chart(self, ticker: str) -> None:
@@ -3579,6 +3774,135 @@ class DeskUI:
         except Exception:
             return None
 
+    # ---------- BRTI 15 分钟 K 线（与 KXBTC15M 结算窗口对齐） ----------
+    _BRTI_KL_HOURS = 8.0     # 回看窗口（小时）
+    _BRTI_KL_MS = 900000     # 15 分钟桶宽（毫秒）
+
+    @classmethod
+    def _brti_bucket_start(cls, ts_ms: int) -> int:
+        """把毫秒时间戳对齐到所属 15 分钟桶的起点（:00 / :15 / :30 / :45）。
+
+        本机时区为 UTC+8 整小时偏移，本地 :00/:15/:30/:45 与 epoch 季度边界重合，
+        因此直接按 900000ms 取整即可与 KXBTC15M 的结算窗口一一对应。
+        """
+        return (int(ts_ms) // cls._BRTI_KL_MS) * cls._BRTI_KL_MS
+
+    def _load_brti_candles(self) -> list:
+        """从 DuckDB 取近 N 小时 BRTI tick，聚合成 15 分钟 OHLC（在 io 线程执行）。"""
+        now_ms = int(time.time() * 1000)
+        since_ms = self._brti_bucket_start(
+            now_ms - int(self._BRTI_KL_HOURS * 3600 * 1000))
+        try:
+            rows = db.cfb_ticks_range(self.api.env, "BRTI", since_ms)
+        except Exception:
+            return []
+        buckets: dict[int, dict] = {}
+        for r in rows:
+            ts, val = r.get("time_ms"), r.get("value")
+            if ts is None or val is None:
+                continue
+            start = self._brti_bucket_start(ts)
+            b = buckets.get(start)
+            if b is None:
+                buckets[start] = {"t": start, "open": val, "high": val,
+                                  "low": val, "close": val}
+            else:
+                b["high"] = max(b["high"], val)
+                b["low"] = min(b["low"], val)
+                b["close"] = val
+        return [buckets[k] for k in sorted(buckets)]
+
+    @staticmethod
+    def _brti_chart_options(candles: list) -> dict:
+        """BRTI 15 分钟蜡烛图：绿涨红跌，X 轴按桶起点显示 HH:MM。"""
+        up, down = "#35e0a1", "#ef4444"
+        cats, prev_day = [], None
+        for c in candles:
+            t = datetime.fromtimestamp(c["t"] / 1000.0)
+            # 跨天只在当天第一根前加日期，避免长时间缺口后 HH:MM 重复看不出来
+            cats.append(f"{t:%m-%d %H:%M}" if t.date() != prev_day else f"{t:%H:%M}")
+            prev_day = t.date()
+        data = [[round(c["open"], 2), round(c["close"], 2),
+                 round(c["low"], 2), round(c["high"], 2)] for c in candles]
+        return {
+            "animation": False,
+            "grid": {"left": 64, "right": 16, "top": 12, "bottom": 26},
+            "tooltip": {"trigger": "axis", "axisPointer": {"type": "cross"}},
+            "xAxis": {"type": "category", "data": cats,
+                      "axisLabel": {"fontSize": 9, "color": "#888"},
+                      "axisLine": {"lineStyle": {"color": "#333"}}},
+            "yAxis": {"type": "value", "scale": True, "name": "BRTI $",
+                      "nameTextStyle": {"fontSize": 9, "color": "#888"},
+                      "axisLabel": {"fontSize": 9, "color": "#888"},
+                      "splitLine": {"lineStyle": {"color": "#222"}}},
+            "series": [{
+                "name": "BRTI 15m",
+                "type": "candlestick",
+                "data": data,
+                "barMaxWidth": 14,
+                "itemStyle": {"color": up, "color0": down,
+                              "borderColor": up, "borderColor0": down},
+            }],
+        }
+
+    def _brti_hide(self) -> None:
+        if card := self._el("brti_card"):
+            card.visible = False
+
+    async def _refresh_brti_kline(self) -> None:
+        """BRTI 15 分钟 K 线：仅 BTC 类市场显示；20 秒回库聚合，2 秒贴 WS 最新价。"""
+        if not (self.api and self._quote and self.trade_dlg.value):
+            return
+        if not self._el("brti_card") or not self._el("brti_chart"):
+            return
+        if self.cf_index_id_for_ticker(self._quote.get("ticker", "")) != "BRTI":
+            self._brti_hide()
+            return
+        if self._brti_busy:
+            return
+        self._brti_busy = True
+        try:
+            now = time.time()
+            start = self._brti_bucket_start(int(now * 1000))
+            # 进入新桶 / 缓存过期时才回库重算，其余周期只更新当前这根蜡烛
+            if (not self._brti_candles or start != self._brti_bucket
+                    or now - self._brti_last_fetch >= 20):
+                candles = await run.io_bound(self._load_brti_candles)
+                if not self.trade_dlg.value:
+                    return
+                self._brti_candles = candles
+                self._brti_last_fetch = now
+                self._brti_bucket = start
+            candles = [dict(c) for c in self._brti_candles]
+            live = ((self.cfb_latest or {}).get("BRTI") or {}).get("value")
+            if candles and live is not None and candles[-1]["t"] == start:
+                last = candles[-1]
+                last["close"] = live
+                last["high"] = max(last["high"], live)
+                last["low"] = min(last["low"], live)
+            if card := self._el("brti_card"):
+                card.visible = True
+            if chart := self._el("brti_chart"):
+                chart.options.clear()
+                chart.options.update(self._brti_chart_options(candles))
+                chart.update()
+            if info := self._el("brti_info"):
+                if candles:
+                    last = candles[-1]
+                    t0 = datetime.fromtimestamp(last["t"] / 1000.0)
+                    t1 = datetime.fromtimestamp(last["t"] / 1000.0 + 900)
+                    info.set_text(
+                        f"近 {len(candles)} 根 · {t0:%m-%d %H:%M}–{t1:%H:%M}  "
+                        f"开 {usd(last['open'])} 高 {usd(last['high'])} "
+                        f"低 {usd(last['low'])} 现 {usd(last['close'])}")
+                else:
+                    info.set_text("暂无 BRTI tick，等待 CFB 采集")
+        except Exception as ex:
+            if info := self._el("brti_info"):
+                info.set_text(f"K 线加载失败：{str(ex)[:100]}")
+        finally:
+            self._brti_busy = False
+
     @staticmethod
     def _price_line_text(quote: dict) -> str:
         return (
@@ -3602,6 +3926,7 @@ class DeskUI:
         if not quote:
             self.q_line.set_text("")
             self._cfb_hide()
+            self._brti_hide()
             return
         p = self.pos_by_ticker.get(quote.get("ticker") or "")
         self.q_line.set_text(self._price_line_text(quote))
